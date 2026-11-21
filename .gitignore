@@ -1,0 +1,46 @@
+# git ignore for Incident Copilot
+# ----------------------------------
+
+# Python
+__pycache__
+*.pyc
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# Virtual envs
+.venv
+venv/
+env/
+
+# Dotenv  (never commit real secrets)
+.env
+*.log
+data/
+
+# Coverage
+.coverage
+htmlcov/
+.pytest_cache/
+
+# Type / lint caches
+.mypy_cache/
+.ruff_cache/
+
+# IDE
+.vscode/
+.idea/
+*.iml
+
+# Docker volumes (if accidentally created locally)
+pg_data/
+
+# OS
+.DS_Store
+Thumbs.db
