@@ -27,7 +27,7 @@ incident-copilot/
 │   ├── detection/    # River HalfSpaceTrees online anomaly scorer
 │   ├── incidents/    # Incident CRUD, merge logic, Postgres models
 │   ├── agent/        # LLM agent: provider wrapper, tools, prompts
-│   └── db/           # SQLAlchemy engine / session factory, Alembic env
+│   └── db/           # SQLAlchemy engine / session factory, schema init
 ├── cli/              # Typer CLI (ingest, investigate, list-incidents …)
 ├── testbed/          # Synthetic log generators & replay utilities
 ├── eval/             # Precision/recall harness, LLM grader

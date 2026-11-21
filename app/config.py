@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 from functools import lru_cache
+from typing import Any
 
 from dotenv import load_dotenv
 
@@ -31,6 +32,24 @@ class Settings:
         self.window_seconds = int(os.getenv("WINDOW_SECONDS", "10"))
         self.warmup_windows = int(os.getenv("WARMUP_WINDOWS", "30"))
         self.anomaly_gap_seconds = int(os.getenv("ANOMALY_GAP_SECONDS", "30"))
+        self.top_k_templates = int(os.getenv("TOP_K_TEMPLATES", "30"))
+        self.window_grace_seconds = int(os.getenv("WINDOW_GRACE_SECONDS", "5"))
+        self.hst_n_trees = int(os.getenv("HST_N_TREES", "25"))
+        self.hst_height = int(os.getenv("HST_HEIGHT", "15"))
+        self.hst_window_size = int(os.getenv("HST_WINDOW_SIZE", "100"))
+        self.threshold_lookback = int(os.getenv("THRESHOLD_LOOKBACK", "200"))
+        self.threshold_std_mult = float(os.getenv("THRESHOLD_STD_MULT", "3.0"))
+        self.consecutive_high_windows = int(os.getenv("CONSECUTIVE_HIGH_WINDOWS", "2"))
+        self.incident_cooldown_seconds = int(os.getenv("INCIDENT_COOLDOWN_SECONDS", "60"))
+        self.max_agent_tool_calls = int(os.getenv("MAX_AGENT_TOOL_CALLS", "5"))
+        self.drain_state_path = os.getenv("DRAIN_STATE_PATH", "data/drain_state.bin")
+        self.metrics_sample_seconds = int(os.getenv("METRICS_SAMPLE_SECONDS", "5"))
+
+    def __getattr__(self, name: str) -> Any:
+        lower = name.lower()
+        if lower in self.__dict__:
+            return self.__dict__[lower]
+        raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
 
 
 @lru_cache(maxsize=1)
