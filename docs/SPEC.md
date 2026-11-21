@@ -22,8 +22,9 @@
 │   (file tail · syslog UDP · HTTP POST /ingest)                    │
 └───────────────────┬───────────────────────────────────────────────┘
                     │ raw log lines (text)
-
-                    | **Low cost**
+                    ▼
+┌───────────────────────────────────────────────────────────────────┐
+│  Stage 1 – Drain3 Online Log Parser        [app/parsing/]         │
 │  • Template extraction via depth-limited parse tree               │
 │  • Output: (template_id, template_str, variables[], timestamp)    │
 └───────────────────┬───────────────────────────────────────────────┘
@@ -31,24 +32,24 @@
                     ▼
 ┌───────────────────────────────────────────────────────────────────┐
 │  Stage 2 – Time-Window Feature Extractor   [app/detection/]       │
-│  • Non-overlapping windows of WINDOW_SIZE_SECONDS seconds         │
+│  • Non-overlapping windows of WINDOW_SECONDS seconds              │
 │  • Feature vector per window (see §4)                             │
-│  • Warm-up period: first ANOMALY_WARMUP_WINDOWS windows skipped   │
+│  • Warm-up period: first WARMUP_WINDOWS windows skipped           │
 └───────────────────┬───────────────────────────────────────────────┘
                     │ feature vectors
                     ▼
 ┌───────────────────────────────────────────────────────────────────┐
 │  Stage 3 – River HalfSpaceTrees Scorer     [app/detection/]       │
-│  • Online, one-class anomaly detection                             │
+│  • Online, one-class anomaly detection                            │
 │  • Outputs score ∈ [0, 1]; higher → more anomalous                │
-│  • Windows with score > ANOMALY_THRESHOLD are "anomalous"         │
+│  • Windows with score > dynamic threshold are "anomalous"         │
 └───────────────────┬───────────────────────────────────────────────┘
                     │ (window, score, is_anomalous)
                     ▼
 ┌───────────────────────────────────────────────────────────────────┐
 │  Stage 4 – Incident Merger                 [app/incidents/]       │
-│  • Consecutive anomalous windows within INCIDENT_MERGE_GAP_SECONDS│
-│    are merged into a single Incident record                        │
+│  • Consecutive anomalous windows within ANOMALY_GAP_SECONDS       │
+│    are merged into a single Incident record                       │
 │  • Incidents are persisted to PostgreSQL                          │
 │  • Status lifecycle: OPEN → INVESTIGATING → RESOLVED / DISMISSED  │
 └───────────────────┬───────────────────────────────────────────────┘
@@ -67,11 +68,32 @@
 ┌───────────────────────────────────────────────────────────────────┐
 │  Stage 6 – Human in the Loop                                      │
 │  • Operator reviews via CLI (`incident-copilot investigate <id>`) │
-│    or REST API (GET /incidents/{id})                               │
+│    or REST API (GET /incidents/{id})                              │
 │  • Operator chooses: acknowledge / dismiss / mark-resolved        │
 │  • NO auto-execution of remediation steps                         │
 └───────────────────────────────────────────────────────────────────┘
 ```
+
+### 2.1 Pipeline Interface
+
+The ingestion and execution runtime communicates with the processing stages through the `Pipeline` interface defined in `app/pipeline.py`:
+
+```python
+class Pipeline:
+    def process(self, event: dict[str, Any]) -> None:
+        """Ingest a single structured log event into the pipeline."""
+
+    def tick(self, now: datetime) -> None:
+        """Wall-clock or event-time heartbeat to close windows and incidents
+        when no new events arrive."""
+
+    def flush(self) -> None:
+        """Close everything (end of replay / shutdown)."""
+```
+
+- **`process(event: dict[str, Any]) -> None`**: Called whenever a log event is ingested (via file tailing, syslog UDP, or HTTP POST `/ingest/logs`). In the current groundwork stage, it counts events by service. In subsequent stages, it passes events to Drain3 parsing and window feature extraction.
+- **`tick(now: datetime) -> None`**: Provides an event-time or wall-clock heartbeat. It ensures that time windows and incidents are closed cleanly when log traffic stalls or stops. In production, a background task in the FastAPI lifespan calls `tick(now)` every 1 second. During offline replay, the testbed replayer emits ticks based on log event timestamps.
+- **`flush() -> None`**: Shuts down the pipeline cleanly, closing all open windows, finalizing in-flight incidents, and saving parser/model state (e.g. Drain3 state to disk). Called during FastAPI lifespan shutdown and at the end of benchmark replay sessions.
 
 ---
 
@@ -240,8 +262,29 @@ The harness measures:
 
 ## 9. Configuration Reference
 
-See [`.env.example`](../.env.example) and [`app/config.py`](../app/config.py) for the
-authoritative list of environment variables and their defaults.
+All settings are read from environment variables or `.env`. Below is the complete reference of configuration options:
+
+| Setting | Type | Default | Description |
+|---|---|---|---|
+| `DATABASE_URL` | `str` | `postgresql+psycopg://postgres:postgres@localhost:5432/incident_copilot` | PostgreSQL connection string |
+| `LLM_PROVIDER` | `str` | `gemini` | LLM backend provider (`gemini` or `mock`) |
+| `GEMINI_API_KEY` | `str` | `your_key_here` | API key for Gemini; evaluated only upon making LLM calls |
+| `GEMINI_MODEL` | `str` | `gemini-3.8-flash` | Gemini model identifier forwarded to the SDK |
+| `WINDOW_SECONDS` | `int` | `10` | Duration of each aggregation time window in seconds |
+| `WARMUP_WINDOWS` | `int` | `30` | Initial baseline windows observed before scoring is trusted |
+| `ANOMALY_GAP_SECONDS` | `int` | `30` | Maximum interval to merge adjacent anomalous windows into one incident |
+| `TOP_K_TEMPLATES` | `int` | `30` | Number of most frequent log templates tracked in state/features |
+| `WINDOW_GRACE_SECONDS` | `int` | `5` | Grace period in seconds to accept out-of-order log events before closing window |
+| `HST_N_TREES` | `int` | `25` | Number of trees in River HalfSpaceTrees online anomaly detector |
+| `HST_HEIGHT` | `int` | `15` | Maximum depth of trees in HalfSpaceTrees ensemble |
+| `HST_WINDOW_SIZE` | `int` | `100` | Sliding window size parameter for HalfSpaceTrees |
+| `THRESHOLD_LOOKBACK` | `int` | `200` | Number of historical window scores used to compute dynamic threshold |
+| `THRESHOLD_STD_MULT` | `float` | `3.0` | Multiplier for standard deviation over rolling mean for threshold |
+| `CONSECUTIVE_HIGH_WINDOWS` | `int` | `2` | Number of consecutive anomalous windows required to open an incident |
+| `INCIDENT_COOLDOWN_SECONDS` | `int` | `60` | Cooldown period before a new incident can open for the same service |
+| `MAX_AGENT_TOOL_CALLS` | `int` | `5` | Maximum number of tool iterations permitted per incident investigation |
+| `DRAIN_STATE_PATH` | `str` | `data/drain_state.bin` | File path for persisting Drain3 parse tree state |
+| `METRICS_SAMPLE_SECONDS` | `int` | `5` | Interval in seconds between background host metric samples |
 
 ---
 

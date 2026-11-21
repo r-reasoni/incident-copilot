@@ -63,8 +63,8 @@ Copy-Item .env.example .env  # PowerShell
 # 5. Start PostgreSQL (works without Make)
 docker compose up -d --wait
 
-# 6. Apply database migrations
-make migrate
+# 6. Initialize database schema
+python -m app.db.init
 
 # 7. Run tests
 pytest
@@ -86,19 +86,21 @@ The FastAPI interactive docs will be at <http://localhost:8000/docs>.
 
 ## Makefile Targets
 
-| Target | Description |
-|---|---|
-| `make up` | Start PostgreSQL via Docker Compose |
-| `make down` | Stop containers (data preserved) |
-| `make install` | Install Python deps into active venv |
-| `make test` | Run the full pytest suite |
-| `make test-cov` | Run tests with HTML coverage report |
-| `make run-api` | Start FastAPI dev server with auto-reload |
-| `make migrate` | Run Alembic `upgrade head` |
-| `make lint` | Run `ruff check` |
-| `make format` | Run `ruff format` |
-| `make typecheck` | Run `mypy` |
-| `make clean` | Remove cache dirs |
+| Target | Plain Command (PowerShell / Bash) | Description |
+|---|---|---|
+| `make up` | `docker compose up -d --wait` | Start PostgreSQL via Docker Compose |
+| `make down` | `docker compose down` | Stop containers (data preserved) |
+| `make down-volumes` | `docker compose down -v` | Stop containers AND destroy Postgres volume |
+| `make logs` | `docker compose logs -f` | Tail container logs |
+| `make install` | `pip install -e ".[dev]"` | Install Python deps into active venv |
+| `make migrate` | `python -m app.db.init` | Initialize PostgreSQL schema |
+| `make test` | `pytest` | Run the full pytest suite |
+| `make test-cov` | `pytest --cov=app --cov-report=html --cov-report=term-missing` | Run tests with HTML coverage report |
+| `make lint` | `ruff check .` | Run `ruff check` |
+| `make format` | `ruff format .` | Run `ruff format` |
+| `make typecheck` | `mypy app cli` | Run `mypy` |
+| `make run-api` | `uvicorn app.api.main:app --reload` | Start FastAPI dev server with auto-reload |
+| `make clean` | `find . -type d -name "__pycache__" -exec rm -rf {} +` | Remove cache dirs and test artifacts |
 
 ---
 
@@ -112,10 +114,22 @@ See [`.env.example`](.env.example) for the full list with descriptions.
 | `DATABASE_URL` | `postgresql+psycopg://postgres:postgres@localhost:5432/incident_copilot` | Postgres connection string |
 | `LLM_PROVIDER` | `gemini` | `gemini` or `mock` |
 | `GEMINI_API_KEY` | `your_key_here` | Gemini API key; required only when a Gemini call is made |
-| `GEMINI_MODEL` | `gemini-2.5-flash` | Model name forwarded to the SDK |
-| `WINDOW_SECONDS` | `10` | Feature-extraction time window |
-| `WARMUP_WINDOWS` | `30` | Windows before scoring is trusted |
+| `GEMINI_MODEL` | `gemini-3.8-flash` | Model name forwarded to the SDK |
+| `WINDOW_SECONDS` | `10` | Feature-extraction time window in seconds |
+| `WARMUP_WINDOWS` | `30` | Number of initial windows before scoring is trusted |
 | `ANOMALY_GAP_SECONDS` | `30` | Max gap to merge adjacent anomalous windows |
+| `TOP_K_TEMPLATES` | `30` | Number of top templates tracked |
+| `WINDOW_GRACE_SECONDS` | `5` | Grace period in seconds for late-arriving events |
+| `HST_N_TREES` | `25` | Number of trees in HalfSpaceTrees online detector |
+| `HST_HEIGHT` | `15` | Depth/height of each tree in HalfSpaceTrees |
+| `HST_WINDOW_SIZE` | `100` | Window size for River HalfSpaceTrees |
+| `THRESHOLD_LOOKBACK` | `200` | Past window scores lookback for dynamic threshold |
+| `THRESHOLD_STD_MULT` | `3.0` | Standard deviation multiplier for anomaly threshold |
+| `CONSECUTIVE_HIGH_WINDOWS` | `2` | Consecutive anomalous windows required for incident |
+| `INCIDENT_COOLDOWN_SECONDS` | `60` | Cooldown period before creating a new incident |
+| `MAX_AGENT_TOOL_CALLS` | `5` | Max tool executions per LLM incident investigation |
+| `DRAIN_STATE_PATH` | `data/drain_state.bin` | File path for persisting Drain3 parser state |
+| `METRICS_SAMPLE_SECONDS` | `5` | Interval in seconds for sampling host metrics |
 
 ---
 
@@ -124,7 +138,7 @@ See [`.env.example`](.env.example) for the full list with descriptions.
 | Layer | Technology |
 |---|---|
 | Web API | FastAPI + Uvicorn |
-| Database | PostgreSQL 16 (Docker) + SQLAlchemy 2 + Alembic |
+| Database | PostgreSQL 16 (Docker) + SQLAlchemy 2 |
 | DB Driver | psycopg3 (`psycopg[binary]`) |
 | Log parsing | Drain3 |
 | Online ML | River – HalfSpaceTrees |

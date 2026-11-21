@@ -21,7 +21,7 @@ def test_config_defaults(monkeypatch) -> None:
 
     monkeypatch.setenv("LLM_PROVIDER", "gemini")
     monkeypatch.setenv("GEMINI_API_KEY", "your_key_here")
-    monkeypatch.setenv("GEMINI_MODEL", "gemini-2.5-flash")
+    monkeypatch.setenv("GEMINI_MODEL", "gemini-3.8-flash")
     monkeypatch.setenv(
         "DATABASE_URL",
         "postgresql+psycopg://postgres:postgres@localhost:5432/incident_copilot",
@@ -34,13 +34,54 @@ def test_config_defaults(monkeypatch) -> None:
 
     assert s.llm_provider == "gemini"
     assert s.gemini_api_key == "your_key_here"
-    assert s.gemini_model == "gemini-2.5-flash"
+    assert s.gemini_model == "gemini-3.8-flash"
     assert s.database_url == (
         "postgresql+psycopg://postgres:postgres@localhost:5432/incident_copilot"
     )
     assert s.window_seconds == 10
     assert s.warmup_windows == 30
     assert s.anomaly_gap_seconds == 30
+    assert s.top_k_templates == 30
+    assert s.window_grace_seconds == 5
+    assert s.hst_n_trees == 25
+    assert s.hst_height == 15
+    assert s.hst_window_size == 100
+    assert s.threshold_lookback == 200
+    assert s.threshold_std_mult == 3.0
+    assert s.consecutive_high_windows == 2
+    assert s.incident_cooldown_seconds == 60
+    assert s.max_agent_tool_calls == 5
+    assert s.drain_state_path == "data/drain_state.bin"
+    assert s.metrics_sample_seconds == 5
+
+
+def test_every_variable_in_env_example_is_defined_in_config() -> None:
+    """Every non-comment variable defined in .env.example must be exposed on Settings."""
+    from pathlib import Path
+
+    from app.config import Settings
+
+    env_example = Path(__file__).resolve().parent.parent / ".env.example"
+    assert env_example.exists(), ".env.example file must exist"
+
+    variables: list[str] = []
+    with open(env_example, encoding="utf-8") as f:
+        for line in f:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            key = stripped.split("=", 1)[0].strip()
+            if key:
+                variables.append(key)
+
+    assert len(variables) > 0, "No variables found in .env.example"
+
+    settings = Settings()
+    for var in variables:
+        msg = f"{var} from .env.example not found on Settings"
+        assert hasattr(settings, var.lower()), msg
+        # Also verify case-insensitive / getattr access works
+        assert getattr(settings, var) is not None, msg
 
 
 def test_config_loads_environment_values(monkeypatch) -> None:

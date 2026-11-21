@@ -3,8 +3,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from contextlib import asynccontextmanager
-from datetime import datetime
+from contextlib import asynccontextmanager, suppress
+from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
@@ -98,20 +98,35 @@ async def _ingest_consumer(application: FastAPI) -> None:
         queue.task_done()
 
 
+async def _tick_worker(application: FastAPI) -> None:
+  pipeline: Pipeline = application.state.pipeline
+  while True:
+    try:
+      await asyncio.sleep(1.0)
+      pipeline.tick(datetime.now(UTC))
+    except asyncio.CancelledError:
+      break
+    except Exception:
+      logger.exception("Error in pipeline tick worker")
+
+
 @asynccontextmanager
 async def lifespan(application: FastAPI):
-    application.state.ingest_queue = asyncio.Queue(maxsize=QUEUE_MAXSIZE)
-    application.state.pipeline = Pipeline()
-    consumer = asyncio.create_task(_ingest_consumer(application))
-    try:
-        yield
-    finally:
-        await application.state.ingest_queue.join()
-        consumer.cancel()
-        try:
-            await consumer
-        except asyncio.CancelledError:
-            pass
+  application.state.ingest_queue = asyncio.Queue(maxsize=QUEUE_MAXSIZE)
+  application.state.pipeline = Pipeline()
+  consumer = asyncio.create_task(_ingest_consumer(application))
+  ticker = asyncio.create_task(_tick_worker(application))
+  try:
+    yield
+  finally:
+    ticker.cancel()
+    with suppress(asyncio.CancelledError):
+      await ticker
+    await application.state.ingest_queue.join()
+    consumer.cancel()
+    with suppress(asyncio.CancelledError):
+      await consumer
+    application.state.pipeline.flush()
 
 app = FastAPI(
     title="Incident Copilot",

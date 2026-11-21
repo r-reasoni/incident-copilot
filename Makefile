@@ -19,7 +19,7 @@ API_PORT      ?= 8000
 # Help
 # ---------------------------------------------------------------------------
 .PHONY: help
-help:            ## Show this help message
+help:            ## Show this help message (`make help`)
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
 	  awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}'
 
@@ -27,51 +27,47 @@ help:            ## Show this help message
 # Infrastructure
 # ---------------------------------------------------------------------------
 .PHONY: up
-up:              ## Start PostgreSQL (and any future services) via Docker Compose
+up:              ## Start PostgreSQL via Docker Compose (`docker compose up -d --wait`)
 	docker compose -f $(COMPOSE_FILE) up -d --wait
 	@echo "✅  PostgreSQL is up on port 5432"
 
 .PHONY: down
-down:            ## Stop and remove containers (data volume preserved)
+down:            ## Stop and remove containers (`docker compose down`)
 	docker compose -f $(COMPOSE_FILE) down
 	@echo "🛑  Containers stopped"
 
 .PHONY: down-volumes
-down-volumes:    ## Stop containers AND destroy the Postgres data volume
+down-volumes:    ## Stop containers AND destroy Postgres volume (`docker compose down -v`)
 	docker compose -f $(COMPOSE_FILE) down -v
 	@echo "🗑️   Containers and volumes removed"
 
 .PHONY: logs
-logs:            ## Tail container logs
+logs:            ## Tail container logs (`docker compose logs -f`)
 	docker compose -f $(COMPOSE_FILE) logs -f
 
 # ---------------------------------------------------------------------------
 # Python environment
 # ---------------------------------------------------------------------------
 .PHONY: install
-install:         ## Install project + dev dependencies into the active venv
+install:         ## Install project + dev dependencies into active venv (`pip install -e ".[dev]"`)
 	pip install -e ".[dev]"
 
 # ---------------------------------------------------------------------------
-# Database migrations (Alembic – stubs, populated in later prompts)
+# Database schema initialization
 # ---------------------------------------------------------------------------
 .PHONY: migrate
-migrate:         ## Run Alembic migrations (upgrade head)
-	alembic upgrade head
-
-.PHONY: migration
-migration:       ## Generate a new Alembic migration (MSG="describe change")
-	alembic revision --autogenerate -m "$(MSG)"
+migrate:         ## Initialize database schema (`python -m app.db.init`)
+	python -m app.db.init
 
 # ---------------------------------------------------------------------------
 # Testing
 # ---------------------------------------------------------------------------
 .PHONY: test
-test:            ## Run the full pytest suite
+test:            ## Run the full pytest suite (`pytest -v`)
 	pytest $(PYTEST_ARGS)
 
 .PHONY: test-cov
-test-cov:        ## Run pytest with HTML coverage report
+test-cov:        ## Run pytest with HTML coverage report (`pytest --cov=app --cov-report=html --cov-report=term-missing`)
 	pytest --cov=app --cov-report=html --cov-report=term-missing $(PYTEST_ARGS)
 	@echo "📊 Coverage report: htmlcov/index.html"
 
@@ -79,32 +75,32 @@ test-cov:        ## Run pytest with HTML coverage report
 # Linting / type-checking
 # ---------------------------------------------------------------------------
 .PHONY: lint
-lint:            ## Run ruff linter
+lint:            ## Run ruff linter (`ruff check .`)
 	ruff check .
 
 .PHONY: format
-format:          ## Auto-format with ruff
+format:          ## Auto-format with ruff (`ruff format .`)
 	ruff format .
 
 .PHONY: typecheck
-typecheck:       ## Run mypy
+typecheck:       ## Run mypy (`mypy app cli`)
 	mypy app cli
 
 # ---------------------------------------------------------------------------
 # API server
 # ---------------------------------------------------------------------------
 .PHONY: run-api
-run-api:         ## Start the FastAPI dev server (auto-reload)
+run-api:         ## Start FastAPI dev server (`uvicorn app.api.main:app --reload`)
 	uvicorn app.api.main:app --host $(API_HOST) --port $(API_PORT) --reload
 
 # ---------------------------------------------------------------------------
 # Convenience
 # ---------------------------------------------------------------------------
 .PHONY: dev
-dev: up install  ## Bring up infra + install deps in one shot
+dev: up install  ## Bring up infra + install deps (`docker compose up -d --wait && pip install -e ".[dev]"`)
 
 .PHONY: clean
-clean:           ## Remove Python cache files
+clean:           ## Remove cache files (`find . -name "__pycache__" ...`)
 	find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
 	find . -type f -name "*.pyc" -delete 2>/dev/null || true
 	rm -rf .mypy_cache .ruff_cache .pytest_cache htmlcov .coverage
