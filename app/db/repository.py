@@ -7,7 +7,7 @@ from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
-from app.db.models import FaultEvent, Incident, LogEvent, Template, WindowScore
+from app.db.models import FaultEvent, Incident, LogEvent, MetricsSample, Template, WindowScore
 
 
 def insert_logs(session: Session, logs: list[dict[str, Any]]) -> list[int]:
@@ -44,6 +44,23 @@ def upsert_template(
     template = session.scalars(statement).one()
     session.flush()
     return template
+
+
+def upsert_templates(session: Session, templates: list[dict[str, Any]]) -> None:
+    """Batch insert or update templates, accumulating counts and updating latest template_text."""
+    if not templates:
+        return
+    statement = insert(Template).values(templates)
+    statement = statement.on_conflict_do_update(
+        index_elements=[Template.template_id],
+        set_={
+            "template_text": statement.excluded.template_text,
+            "first_seen": func.least(Template.first_seen, statement.excluded.first_seen),
+            "count": Template.count + statement.excluded.count,
+        },
+    )
+    session.execute(statement)
+    session.flush()
 
 
 def save_window_score(session: Session, **values: Any) -> WindowScore:
@@ -124,3 +141,31 @@ def insert_fault_event(session: Session, **values: Any) -> FaultEvent:
 def list_fault_events(session: Session) -> list[FaultEvent]:
     """List evaluation ground-truth events in start-time order."""
     return list(session.scalars(select(FaultEvent).order_by(FaultEvent.started_at, FaultEvent.id)))
+
+
+
+def insert_metrics_sample(session: Session, **values: Any) -> MetricsSample:
+    """Insert a single host/probe metrics sample."""
+    sample = MetricsSample(**values)
+    session.add(sample)
+    session.flush()
+    return sample
+
+
+def get_metrics(
+    session: Session,
+    service: str,
+    start: datetime,
+    end: datetime,
+) -> list[MetricsSample]:
+    """Retrieve metrics samples for a service within [start, end) in time order."""
+    statement = (
+        select(MetricsSample)
+        .where(
+            MetricsSample.service == service,
+            MetricsSample.ts >= start,
+            MetricsSample.ts < end,
+        )
+        .order_by(MetricsSample.ts.asc(), MetricsSample.id.asc())
+    )
+    return list(session.scalars(statement))

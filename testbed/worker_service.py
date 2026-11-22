@@ -101,6 +101,12 @@ async def lifespan(_: FastAPI):
 app = FastAPI(title="Testbed Worker Service", lifespan=lifespan)
 
 
+@app.get("/health")
+def health() -> dict[str, str]:
+    return {"status": "ok"}
+
+
+
 @app.middleware("http")
 async def observe_requests(request: Request, call_next):
     started = time.perf_counter()
@@ -166,17 +172,14 @@ def start_fault(payload: dict[str, Any]) -> dict[str, str]:
         return JSONResponse(status_code=400, content={"detail": "unsupported fault type"})
     try:
         faults.start(kind, payload.get("params") or {}, shipper.log)
-    except Exception as error:
-        shipper.log("ERROR", f"Fault control failed with {type(error).__name__}")
+    except Exception:
         return JSONResponse(status_code=503, content={"detail": "fault could not be started"})
-    shipper.log("INFO", "Operational conditions changed")
     return {"status": "started"}
 
 
 @app.post("/_fault/stop")
 def stop_fault() -> dict[str, str]:
     faults.stop()
-    shipper.log("INFO", "Operational conditions returned to normal")
     return {"status": "stopped"}
 
 

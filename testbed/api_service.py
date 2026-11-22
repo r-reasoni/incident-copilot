@@ -126,7 +126,7 @@ def create_order(order: OrderRequest) -> dict[str, Any]:
         result = {"id": item.id, "user_id": item.user_id, "amount": item.amount}
     elapsed_ms = (time.perf_counter() - started) * 1000
     if elapsed_ms > 500:
-        shipper.log("WARN", f"Order persistence resumed after database lock wait in {elapsed_ms:.0f}ms")
+        shipper.log("WARN", f"Order persistence resumed after delay of {elapsed_ms:.0f}ms")
     else:
         shipper.log(
             "INFO",
@@ -192,14 +192,11 @@ def start_fault(payload: dict[str, Any]) -> dict[str, str]:
     try:
         faults.start(kind, params, shipper.log)
     except Exception as error:
-        shipper.log("ERROR", f"Fault control failed with {type(error).__name__}")
         raise HTTPException(status_code=503, detail="fault could not be started") from error
-    shipper.log("INFO", "Operational conditions changed")
     return {"status": "started"}
 
 
 @app.post("/_fault/stop")
 def stop_fault() -> dict[str, str]:
     faults.stop()
-    shipper.log("INFO", "Operational conditions returned to normal")
     return {"status": "stopped"}

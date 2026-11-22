@@ -13,8 +13,10 @@ from sqlalchemy import func, select
 
 from app.config import settings
 from app.db.models import Incident, LogEvent, Template, WindowScore
-from app.db.repository import insert_logs, list_incidents
+from app.db.repository import insert_logs, list_incidents, upsert_templates
 from app.db.session import SessionLocal
+from app.incidents import IncidentManager
+from app.parsing import LogParser, ParsedLog
 from app.pipeline import Pipeline
 
 logger = logging.getLogger(__name__)
@@ -59,6 +61,7 @@ class LogEventInput(BaseModel):
 async def _ingest_consumer(application: FastAPI) -> None:
   queue: asyncio.Queue[LogEventInput] = application.state.ingest_queue
   pipeline: Pipeline = application.state.pipeline
+  parser: LogParser = application.state.parser
   while True:
     batch: list[LogEventInput] = []
     try:
@@ -73,24 +76,48 @@ async def _ingest_consumer(application: FastAPI) -> None:
         break
 
     try:
-      with SessionLocal() as session, session.begin():
-        insert_logs(
-          session,
-          [
-            {
-              "ts": event.ts,
-              "service": event.service,
-              "host": event.host,
-              "level": event.level,
-              "raw_message": event.message,
-              "template_id": None,
-              "params": None,
-            }
-            for event in batch
-          ],
-        )
+      parsed_batch: list[tuple[LogEventInput, ParsedLog]] = []
       for event in batch:
-        pipeline.process(event.model_dump())
+        parsed = parser.parse(event.message)
+        parsed_batch.append((event, parsed))
+
+      log_records = [
+        {
+          "ts": event.ts,
+          "service": event.service,
+          "host": event.host,
+          "level": event.level,
+          "raw_message": event.message,
+          "template_id": parsed.template_id,
+          "params": {
+            "values": parsed.params,
+            "duration_ms": parsed.duration_ms,
+          },
+        }
+        for event, parsed in parsed_batch
+      ]
+
+      template_aggregates: dict[int, dict[str, Any]] = {}
+      for event, parsed in parsed_batch:
+        tid = parsed.template_id
+        if tid not in template_aggregates:
+          template_aggregates[tid] = {
+            "template_id": tid,
+            "template_text": parsed.template_text,
+            "first_seen": event.ts,
+            "count": 0,
+          }
+        template_aggregates[tid]["count"] += 1
+        template_aggregates[tid]["template_text"] = parsed.template_text
+        if event.ts < template_aggregates[tid]["first_seen"]:
+          template_aggregates[tid]["first_seen"] = event.ts
+
+      with SessionLocal() as session, session.begin():
+        insert_logs(session, log_records)
+        upsert_templates(session, list(template_aggregates.values()))
+
+      for event, parsed in parsed_batch:
+        pipeline.process(event.model_dump(), parsed)
     except Exception:
       logger.exception("Failed to persist an ingestion batch")
     finally:
@@ -112,8 +139,17 @@ async def _tick_worker(application: FastAPI) -> None:
 
 @asynccontextmanager
 async def lifespan(application: FastAPI):
+  loop = asyncio.get_running_loop()
   application.state.ingest_queue = asyncio.Queue(maxsize=QUEUE_MAXSIZE)
-  application.state.pipeline = Pipeline()
+  parser = LogParser()
+  incident_manager = IncidentManager(loop=loop, broadcast_fn=broadcast_alert)
+  from app.detection import AnomalyDetector
+  detector = AnomalyDetector(on_window=incident_manager.on_window)
+  pipeline = Pipeline(parser=parser, incident_manager=incident_manager, detector=detector)
+  application.state.parser = parser
+  application.state.incident_manager = incident_manager
+  application.state.detector = detector
+  application.state.pipeline = pipeline
   consumer = asyncio.create_task(_ingest_consumer(application))
   ticker = asyncio.create_task(_tick_worker(application))
   try:
@@ -161,8 +197,36 @@ async def ingest_logs(events: list[LogEventInput], request: Request) -> dict[str
 
 
 @app.get("/incidents", tags=["incidents"])
-def get_incidents(status: str | None = None) -> list[dict[str, Any]]:
-    with SessionLocal() as session:
+def get_incidents(status: str | None = None, request: Request = None) -> list[dict[str, Any]]:
+    items = []
+    try:
+        with SessionLocal() as session:
+            items = [
+                {
+                    "id": item.id,
+                    "started_at": item.started_at,
+                    "ended_at": item.ended_at,
+                    "status": item.status,
+                    "peak_score": item.peak_score,
+                    "affected_services": item.affected_services,
+                    "root_cause": item.root_cause,
+                    "confidence": item.confidence,
+                    "remediation": item.remediation,
+                    "llm_calls": item.llm_calls,
+                    "created_at": item.created_at,
+                }
+                for item in list_incidents(session, status)
+            ]
+    except Exception:
+        pass
+
+    if items:
+        return items
+
+    manager: IncidentManager | None = (
+        getattr(request.app.state, "incident_manager", None) if request and hasattr(request, "app") else None
+    )
+    if manager is not None:
         return [
             {
                 "id": item.id,
@@ -171,51 +235,106 @@ def get_incidents(status: str | None = None) -> list[dict[str, Any]]:
                 "status": item.status,
                 "peak_score": item.peak_score,
                 "affected_services": item.affected_services,
-                "root_cause": item.root_cause,
-                "confidence": item.confidence,
-                "remediation": item.remediation,
-                "llm_calls": item.llm_calls,
-                "created_at": item.created_at,
+                "root_cause": None,
+                "confidence": None,
+                "remediation": None,
+                "llm_calls": 0,
+                "created_at": item.started_at,
             }
-            for item in list_incidents(session, status)
+            for item in manager.list_incidents(status)
         ]
+    return []
 
 
 @app.get("/incidents/{incident_id}", tags=["incidents"])
-def get_incident(incident_id: int) -> dict[str, Any]:
-    with SessionLocal() as session:
-        item = session.get(Incident, incident_id)
-        if item is None:
-            raise HTTPException(status_code=404, detail="incident not found")
-        return {
-            "id": item.id,
-            "started_at": item.started_at,
-            "ended_at": item.ended_at,
-            "status": item.status,
-            "peak_score": item.peak_score,
-            "affected_services": item.affected_services,
-            "top_templates": item.top_templates,
-            "root_cause": item.root_cause,
-            "confidence": item.confidence,
-            "remediation": item.remediation,
-            "agent_trace": item.agent_trace,
-            "llm_calls": item.llm_calls,
-            "created_at": item.created_at,
-        }
+def get_incident(incident_id: int, request: Request = None) -> dict[str, Any]:
+    try:
+        with SessionLocal() as session:
+            item = session.get(Incident, incident_id)
+            if item is not None:
+                return {
+                    "id": item.id,
+                    "started_at": item.started_at,
+                    "ended_at": item.ended_at,
+                    "status": item.status,
+                    "peak_score": item.peak_score,
+                    "affected_services": item.affected_services,
+                    "top_templates": item.top_templates,
+                    "root_cause": item.root_cause,
+                    "confidence": item.confidence,
+                    "remediation": item.remediation,
+                    "agent_trace": item.agent_trace,
+                    "llm_calls": item.llm_calls,
+                    "created_at": item.created_at,
+                }
+    except Exception:
+        pass
+
+    manager: IncidentManager | None = (
+        getattr(request.app.state, "incident_manager", None) if request and hasattr(request, "app") else None
+    )
+    if manager is not None:
+        rec = manager.get_incident(incident_id)
+        if rec is not None:
+            return {
+                "id": rec.id,
+                "started_at": rec.started_at,
+                "ended_at": rec.ended_at,
+                "status": rec.status,
+                "peak_score": rec.peak_score,
+                "affected_services": rec.affected_services,
+                "top_templates": rec.top_templates,
+                "root_cause": None,
+                "confidence": None,
+                "remediation": None,
+                "agent_trace": {
+                    "comparison": rec.comparison,
+                    "new_templates": rec.new_templates,
+                    "peak_features": rec.peak_features,
+                },
+                "llm_calls": 0,
+                "created_at": rec.started_at,
+            }
+
+    raise HTTPException(status_code=404, detail="incident not found")
 
 
 @app.get("/stats", tags=["meta"])
-def stats() -> dict[str, int]:
-    with SessionLocal() as session:
+def stats(request: Request = None) -> dict[str, int]:
+    manager: IncidentManager | None = (
+        getattr(request.app.state, "incident_manager", None) if request and hasattr(request, "app") else None
+    )
+    total_logs = manager.total_log_lines if manager else 0
+    total_windows = manager.total_windows if manager else 0
+    incidents_cnt = manager.incidents_count if manager else 0
+    llm_cnt = manager.llm_calls if manager else 0
+
+    try:
+        with SessionLocal() as session:
+            db_logs = session.scalar(select(func.count()).select_from(LogEvent)) or 0
+            db_templates = session.scalar(select(func.count()).select_from(Template)) or 0
+            db_windows = session.scalar(select(func.count()).select_from(WindowScore)) or 0
+            db_incidents = session.scalar(select(func.count()).select_from(Incident)) or 0
+            db_llm = session.scalar(select(func.coalesce(func.sum(Incident.llm_calls), 0))) or 0
+
+            return {
+                "logs_ingested": db_logs or total_logs,
+                "total_log_lines": db_logs or total_logs,
+                "templates": db_templates,
+                "windows_scored": db_windows or total_windows,
+                "total_windows": db_windows or total_windows,
+                "incidents": db_incidents or incidents_cnt,
+                "llm_calls": db_llm or llm_cnt,
+            }
+    except Exception:
         return {
-            "logs_ingested": session.scalar(select(func.count()).select_from(LogEvent)) or 0,
-            "templates": session.scalar(select(func.count()).select_from(Template)) or 0,
-            "windows_scored": session.scalar(select(func.count()).select_from(WindowScore)) or 0,
-            "incidents": session.scalar(select(func.count()).select_from(Incident)) or 0,
-            "llm_calls": session.scalar(
-                select(func.coalesce(func.sum(Incident.llm_calls), 0))
-            )
-            or 0,
+            "logs_ingested": total_logs,
+            "total_log_lines": total_logs,
+            "templates": 0,
+            "windows_scored": total_windows,
+            "total_windows": total_windows,
+            "incidents": incidents_cnt,
+            "llm_calls": llm_cnt,
         }
 
 

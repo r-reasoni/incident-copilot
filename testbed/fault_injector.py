@@ -89,5 +89,21 @@ def inject(
         raise typer.Exit(130)
 
 
+@app.command()
+def stop(
+    service: str = typer.Option("api", help="Target service: api or worker"),
+) -> None:
+    """Stop any active fault on the target service."""
+    endpoint = SERVICES.get(service)
+    if not endpoint:
+        raise ValueError("service must be api or worker")
+    try:
+        with httpx.Client(timeout=5.0) as client:
+            client.post(f"{endpoint}/_fault/stop")
+        typer.echo(f"Sent stop signal to {service}")
+    except httpx.HTTPError as exc:
+        typer.echo(f"Failed to contact {service}: {exc}")
+
+
 if __name__ == "__main__":
     app()

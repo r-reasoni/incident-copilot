@@ -57,8 +57,6 @@ class FaultController:
                 ]
                 for worker in self._cpu_workers:
                     worker.start()
-                if self._log:
-                    self._log("WARN", "CPU scheduling delay increased under sustained compute load")
             elif kind == "memory_leak":
                 cap_mb = max(20, min(int(self.params.get("cap_mb", 800)), 800))
                 rate_mb = max(1, min(int(self.params.get("rate_mb", 20)), 20))
@@ -66,12 +64,8 @@ class FaultController:
                     target=self._allocate_memory, args=(cap_mb, rate_mb), daemon=True
                 )
                 self._memory_thread.start()
-                if self._log:
-                    self._log("WARN", "Process memory allocation rate increased")
             elif kind == "db_lock":
                 self._hold_database_lock()
-                if self._log:
-                    self._log("WARN", "Database write lock is delaying order persistence")
 
     def _allocate_memory(self, cap_mb: int, rate_mb: int) -> None:
         allocated_mb = 0
