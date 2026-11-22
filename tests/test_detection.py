@@ -298,3 +298,231 @@ def test_frozen_top_k_keys_stay_stable_after_warmup() -> None:
 
     for pw in post_windows:
         assert set(pw.features.keys()) == frozen_keys, "Feature keys must remain identical to frozen keys"
+
+
+def test_effective_hst_window_size() -> None:
+    """Effective HST window size is min(HST_WINDOW_SIZE, max(5, WARMUP_WINDOWS // 2))."""
+    # Default warmup 30, configured HST window 100 -> effective is min(100, max(5, 15)) = 15
+    d1 = AnomalyDetector(warmup_windows=30, hst_window_size=100, save_to_db=False)
+    assert d1.hst_window_size == 15
+
+    # Small warmup 8 -> max(5, 4) = 5
+    d2 = AnomalyDetector(warmup_windows=8, hst_window_size=100, save_to_db=False)
+    assert d2.hst_window_size == 5
+
+    # Large warmup 200, small HST window 20 -> min(20, max(5, 100)) = 20
+    d3 = AnomalyDetector(warmup_windows=200, hst_window_size=20, save_to_db=False)
+    assert d3.hst_window_size == 20
+
+
+def test_threshold_ceiling() -> None:
+    """Threshold never exceeds THRESHOLD_CEILING."""
+    detector = AnomalyDetector(
+        warmup_windows=5,
+        threshold_ceiling=0.98,
+        save_to_db=False,
+    )
+    # Populate history with very high scores
+    for _ in range(50):
+        detector._score_history.append(0.999)
+    thresh = detector._compute_threshold()
+    assert thresh is not None
+    assert thresh <= 0.98
+
+
+def test_suspect_window_quarantine_borderline_score() -> None:
+    """A high score followed by a borderline score followed by another anomaly must still be flagged."""
+    detector = AnomalyDetector(
+        warmup_windows=15,
+        consecutive_high_windows=2,
+        suspect_windows=3,
+        threshold_ceiling=0.98,
+        save_to_db=False,
+    )
+    base_epoch = 1_700_000_000.0
+    now = lambda offset: datetime.fromtimestamp(base_epoch + offset, tz=timezone.utc)
+
+    # 15 warmup windows
+    for i in range(15):
+        w = ClosedWindow(
+            now(i * 10),
+            now((i + 1) * 10),
+            {"log_rate": 5.0, "error_rate": 0.0, "warn_rate": 0.0, "duration_mean_ms": 30.0},
+            50,
+        )
+        detector.score_window(w)
+
+    thresh_before = detector._compute_threshold()
+    assert thresh_before is not None
+
+    # Window 16: high anomaly
+    w_high = ClosedWindow(
+        now(150),
+        now(160),
+        {"log_rate": 100.0, "error_rate": 0.95, "warn_rate": 0.05, "duration_mean_ms": 5000.0},
+        1000,
+    )
+    res_high = detector.score_window(w_high)
+    assert res_high.score >= res_high.threshold
+    assert detector._quarantine_remaining == 3
+
+    # Window 17: borderline score (normal features -> score < threshold)
+    w_borderline = ClosedWindow(
+        now(160),
+        now(170),
+        {"log_rate": 5.0, "error_rate": 0.0, "warn_rate": 0.0, "duration_mean_ms": 30.0},
+        50,
+    )
+    hist_len_before = len(detector._score_history)
+    res_borderline = detector.score_window(w_borderline)
+    assert res_borderline.score < res_borderline.threshold
+    # Suspect quarantine was decremented and NOT added to score history
+    assert detector._quarantine_remaining == 2
+    assert len(detector._score_history) == hist_len_before
+
+    # Window 18: high anomaly 1
+    w_ano1 = ClosedWindow(
+        now(170),
+        now(180),
+        {"log_rate": 100.0, "error_rate": 0.95, "warn_rate": 0.05, "duration_mean_ms": 5000.0},
+        1000,
+    )
+    res_ano1 = detector.score_window(w_ano1)
+    assert not res_ano1.is_anomalous  # count = 1
+
+    # Window 19: high anomaly 2 -> must be flagged
+    w_ano2 = ClosedWindow(
+        now(180),
+        now(190),
+        {"log_rate": 100.0, "error_rate": 0.95, "warn_rate": 0.05, "duration_mean_ms": 5000.0},
+        1000,
+    )
+    res_ano2 = detector.score_window(w_ano2)
+    assert res_ano2.is_anomalous
+    assert res_ano2.confirmed_at == now(190)
+
+
+def test_two_faults_60s_apart_both_flagged() -> None:
+    """Two faults 60 seconds apart must both be flagged."""
+    detector = AnomalyDetector(
+        warmup_windows=15,
+        consecutive_high_windows=2,
+        suspect_windows=3,
+        threshold_ceiling=0.98,
+        save_to_db=False,
+    )
+    base_epoch = 1_700_000_000.0
+    now = lambda offset: datetime.fromtimestamp(base_epoch + offset, tz=timezone.utc)
+
+    # 15 warmup windows
+    curr = 0
+    for _ in range(15):
+        w = ClosedWindow(
+            now(curr),
+            now(curr + 10),
+            {"log_rate": 5.0, "error_rate": 0.0, "warn_rate": 0.0, "duration_mean_ms": 25.0},
+            50,
+        )
+        detector.score_window(w)
+        curr += 10
+
+    # Fault 1: 3 windows of high errors
+    fault1_flags = []
+    for _ in range(3):
+        w = ClosedWindow(
+            now(curr),
+            now(curr + 10),
+            {"log_rate": 80.0, "error_rate": 0.9, "warn_rate": 0.1, "duration_mean_ms": 4000.0},
+            800,
+        )
+        fault1_flags.append(detector.score_window(w).is_anomalous)
+        curr += 10
+
+    assert any(fault1_flags), "Fault 1 must be flagged"
+
+    # Recovery: 6 windows (60 seconds) of normal traffic
+    recovery_flags = []
+    for _ in range(6):
+        w = ClosedWindow(
+            now(curr),
+            now(curr + 10),
+            {"log_rate": 5.0, "error_rate": 0.0, "warn_rate": 0.0, "duration_mean_ms": 25.0},
+            50,
+        )
+        recovery_flags.append(detector.score_window(w).is_anomalous)
+        curr += 10
+
+    assert not any(recovery_flags), "Recovery windows should not be flagged"
+
+    # Fault 2: 3 windows of high errors
+    fault2_flags = []
+    for _ in range(3):
+        w = ClosedWindow(
+            now(curr),
+            now(curr + 10),
+            {"log_rate": 80.0, "error_rate": 0.9, "warn_rate": 0.1, "duration_mean_ms": 4000.0},
+            800,
+        )
+        fault2_flags.append(detector.score_window(w).is_anomalous)
+        curr += 10
+
+    assert any(fault2_flags), "Fault 2 must be flagged"
+
+
+def test_confirmed_at_set_only_on_confirming_window() -> None:
+    """confirmed_at is set ONLY on the window where consecutive-high is first met, equals window_end."""
+    detector = AnomalyDetector(
+        warmup_windows=10,
+        consecutive_high_windows=2,
+        save_to_db=False,
+    )
+    base_epoch = 1_700_000_000.0
+    now = lambda offset: datetime.fromtimestamp(base_epoch + offset, tz=timezone.utc)
+
+    # 10 warmup windows (so HST window_size=5 completes reference window)
+    for i in range(10):
+        w = ClosedWindow(
+            now(i * 10),
+            now((i + 1) * 10),
+            {"log_rate": 5.0, "error_rate": 0.0, "warn_rate": 0.0, "duration_mean_ms": 20.0},
+            50,
+        )
+        r = detector.score_window(w)
+        assert r.confirmed_at is None
+
+    # Window 11: first high window (count = 1)
+    w11 = ClosedWindow(
+        now(100),
+        now(110),
+        {"log_rate": 90.0, "error_rate": 0.9, "warn_rate": 0.1, "duration_mean_ms": 4000.0},
+        900,
+    )
+    r11 = detector.score_window(w11)
+    assert not r11.is_anomalous
+    assert r11.confirmed_at is None
+    assert r11.run_start is None
+
+    # Window 12: second high window (count = 2 == consecutive_high_windows) -> CONFIRMED
+    w12 = ClosedWindow(
+        now(110),
+        now(120),
+        {"log_rate": 90.0, "error_rate": 0.9, "warn_rate": 0.1, "duration_mean_ms": 4000.0},
+        900,
+    )
+    r12 = detector.score_window(w12)
+    assert r12.is_anomalous
+    assert r12.confirmed_at == now(120)
+    assert r12.run_start == now(100)
+
+    # Window 13: third high window (count = 3 > consecutive_high_windows) -> still anomalous, but confirmed_at is None
+    w13 = ClosedWindow(
+        now(120),
+        now(130),
+        {"log_rate": 90.0, "error_rate": 0.9, "warn_rate": 0.1, "duration_mean_ms": 4000.0},
+        900,
+    )
+    r13 = detector.score_window(w13)
+    assert r13.is_anomalous
+    assert r13.confirmed_at is None
+    assert r13.run_start == now(100)
+

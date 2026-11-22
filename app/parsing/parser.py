@@ -146,3 +146,8 @@ class LogParser:
         """Return the number of clusters currently tracked."""
         with self._lock:
             return len(self._miner.drain.clusters)
+
+    @property
+    def template_count(self) -> int:
+        """Alias for cluster_count."""
+        return self.cluster_count

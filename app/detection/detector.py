@@ -39,6 +39,7 @@ class WindowResult:
     is_anomalous: bool
     features: dict[str, float]
     run_start: datetime | None = None
+    confirmed_at: datetime | None = None
 
 
 # HST scores are not meaningful until the first HST_WINDOW_SIZE windows have been learned,
@@ -57,6 +58,8 @@ class AnomalyDetector:
         hst_window_size: int | None = None,
         threshold_lookback: int | None = None,
         threshold_std_mult: float | None = None,
+        threshold_ceiling: float | None = None,
+        suspect_windows: int | None = None,
         consecutive_high_windows: int | None = None,
         seed: int = 42,
         save_to_db: bool = True,
@@ -72,12 +75,21 @@ class AnomalyDetector:
         self.hst_height: int = (
             hst_height if hst_height is not None else settings.hst_height
         )
-        # HST window size: half of warmup windows so the model finishes its initial
-        # reference window during warmup and populates score_history with valid baseline scores.
-        self.hst_window_size: int = (
-            hst_window_size
-            if hst_window_size is not None
-            else max(5, self.warmup_windows // 2)
+        base_hst_window = (
+            hst_window_size if hst_window_size is not None else settings.hst_window_size
+        )
+        # HST effective window size:
+        # River's HalfSpaceTrees requires learning HST_WINDOW_SIZE windows to establish
+        # its initial reference tree mass distributions before scores become meaningful.
+        # To guarantee that the model finishes its initial reference window during warm-up
+        # and starts populating threshold history with valid scores before detection begins:
+        # effective_hst_window = min(HST_WINDOW_SIZE, max(5, WARMUP_WINDOWS // 2))
+        self.hst_window_size: int = min(base_hst_window, max(5, self.warmup_windows // 2))
+        logger.info(
+            "Initialized AnomalyDetector: effective_hst_window=%d (configured=%d, warmup_windows=%d)",
+            self.hst_window_size,
+            base_hst_window,
+            self.warmup_windows,
         )
 
         self.threshold_lookback: int = (
@@ -89,6 +101,16 @@ class AnomalyDetector:
             threshold_std_mult
             if threshold_std_mult is not None
             else settings.threshold_std_mult
+        )
+        self.threshold_ceiling: float = (
+            threshold_ceiling
+            if threshold_ceiling is not None
+            else settings.threshold_ceiling
+        )
+        self.suspect_windows: int = (
+            suspect_windows
+            if suspect_windows is not None
+            else settings.suspect_windows
         )
         self.consecutive_high_windows: int = (
             consecutive_high_windows
@@ -109,16 +131,27 @@ class AnomalyDetector:
             seed=self.seed,
         )
 
-        # Pre-seed scaler bounds for standard features to establish meaningful scaling ranges
-        # and prevent division by zero or out-of-bounds collapse in HalfSpaceTrees.
+        # Pre-seed MinMaxScaler min/max bounds using generic domain rules per feature type.
+        # These bounds prevent division by zero or extreme out-of-bounds leaf collapse in HST:
+        # 1. Ratios/shares (error_rate, warn_rate): strictly bounded in [0.0, 1.0].
+        # 2. Latency metrics (duration_mean_ms, duration_p95_ms): plausible service response times
+        #    range from 0ms to 10,000ms (10s max HTTP client timeout). In log1p space: [0, log1p(10000)].
+        # 3. Counts & rates (log_rate, new_template_count, distinct_template_count, tpl_other, err_*):
+        #    plausible event volume is 0 to 1,000 events/second or counts/window. In log1p space: [0, log1p(1000)].
         default_services = getattr(settings, "services", ["api-service", "worker-service"])
         for feat in ["duration_mean_ms", "duration_p95_ms"]:
             self._scaler.min[feat].update(0.0)
-            self._scaler.max[feat].update(math.log1p(5000.0))
+            self._scaler.max[feat].update(math.log1p(10000.0))
 
-        for feat in ["log_rate", "new_template_count", "distinct_template_count", "tpl_other", *[f"err_{svc}" for svc in default_services]]:
+        for feat in [
+            "log_rate",
+            "new_template_count",
+            "distinct_template_count",
+            "tpl_other",
+            *[f"err_{svc}" for svc in default_services],
+        ]:
             self._scaler.min[feat].update(0.0)
-            self._scaler.max[feat].update(math.log1p(200.0))
+            self._scaler.max[feat].update(math.log1p(1000.0))
 
         for feat in ["error_rate", "warn_rate"]:
             self._scaler.min[feat].update(0.0)
@@ -130,6 +163,7 @@ class AnomalyDetector:
         self._score_history: deque[float] = deque(maxlen=self.threshold_lookback)
         self._consecutive_high_count: int = 0
         self._current_run_start: datetime | None = None
+        self._quarantine_remaining: int = 0
 
     def _transform_features(self, features: dict[str, float]) -> dict[str, float]:
         """Apply log1p to count, duration, and rate-derived features."""
@@ -143,14 +177,15 @@ class AnomalyDetector:
         return x
 
     def _compute_threshold(self) -> float | None:
-        """Compute threshold = max(mean + THRESHOLD_STD_MULT*std, 0.9 quantile) over lookback."""
+        """Compute threshold = min(max(mean + THRESHOLD_STD_MULT*std, 0.9 quantile), THRESHOLD_CEILING) over lookback."""
         if len(self._score_history) < 2:
             return None
         scores = np.array(self._score_history)
         mean_val = float(np.mean(scores))
         std_val = float(np.std(scores))
         q90 = float(np.quantile(scores, 0.90))
-        return max(mean_val + self.threshold_std_mult * std_val, q90)
+        computed = max(mean_val + self.threshold_std_mult * std_val, q90, 0.01)
+        return min(computed, self.threshold_ceiling)
 
     def score_window(self, window: ClosedWindow | dict[str, Any]) -> WindowResult:
         """Score a closed window, update anomaly tracking, and persist to database."""
@@ -178,16 +213,18 @@ class AnomalyDetector:
 
             is_anomalous = False
             run_start: datetime | None = None
+            confirmed_at: datetime | None = None
 
             if is_warmup:
                 # During warm-up: always learn and never flag
                 self._scaler.learn_one(x)
                 x_scaled_for_learn = self._scaler.transform_one(x)
                 self._model.learn_one(x_scaled_for_learn)
-                if not getattr(self._model, "_first_window", False) and score > 0.0:
+                if not getattr(self._model, "_first_window", False):
                     self._score_history.append(score)
                 self._consecutive_high_count = 0
                 self._current_run_start = None
+                self._quarantine_remaining = 0
             else:
                 # Post warm-up
                 is_high = threshold is not None and score >= threshold
@@ -200,16 +237,25 @@ class AnomalyDetector:
                     if self._consecutive_high_count >= self.consecutive_high_windows:
                         is_anomalous = True
                         run_start = self._current_run_start
+                        if self._consecutive_high_count == self.consecutive_high_windows:
+                            confirmed_at = w_end
+
+                    # Any window with score >= threshold starts suspect quarantine
+                    self._quarantine_remaining = self.suspect_windows
                 else:
                     self._consecutive_high_count = 0
                     self._current_run_start = None
 
-                # Learning rule: learn ONLY if score < threshold
-                if threshold is None or score < threshold:
-                    self._scaler.learn_one(x)
-                    x_scaled_for_learn = self._scaler.transform_one(x)
-                    self._model.learn_one(x_scaled_for_learn)
-                    self._score_history.append(score)
+                    # If score < threshold, check suspect quarantine
+                    if self._quarantine_remaining > 0:
+                        # Suspect-window quarantine: NOT learned and NOT added to threshold history
+                        self._quarantine_remaining -= 1
+                    else:
+                        # Normal clean window: learn and add to threshold history
+                        self._scaler.learn_one(x)
+                        x_scaled_for_learn = self._scaler.transform_one(x)
+                        self._model.learn_one(x_scaled_for_learn)
+                        self._score_history.append(score)
 
             result = WindowResult(
                 window_start=w_start,
@@ -219,6 +265,7 @@ class AnomalyDetector:
                 is_anomalous=is_anomalous,
                 features=raw_features,
                 run_start=run_start,
+                confirmed_at=confirmed_at,
             )
 
             # Persist every result with repository.save_window_score
@@ -244,6 +291,8 @@ class AnomalyDetector:
                 db_features["_threshold"] = result.threshold
             if result.run_start is not None:
                 db_features["_run_start"] = result.run_start.isoformat()
+            if result.confirmed_at is not None:
+                db_features["_confirmed_at"] = result.confirmed_at.isoformat()
 
             with self.session_factory() as session, session.begin():
                 save_window_score(

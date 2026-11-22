@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from contextlib import asynccontextmanager, suppress
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
@@ -114,6 +116,24 @@ async def _ingest_consumer(application: FastAPI) -> None:
       with SessionLocal() as session, session.begin():
         insert_logs(session, log_records)
         upsert_templates(session, list(template_aggregates.values()))
+
+      record_path = getattr(settings, "record_events_path", "")
+      if record_path:
+        try:
+          p = Path(record_path)
+          p.parent.mkdir(parents=True, exist_ok=True)
+          with p.open("a", encoding="utf-8") as rf:
+            for event in batch:
+              line_data = {
+                "ts": event.ts.isoformat(),
+                "service": event.service,
+                "host": event.host,
+                "level": event.level,
+                "message": event.message,
+              }
+              rf.write(json.dumps(line_data) + "\n")
+        except Exception:
+          logger.exception("Failed to write ingested events to record_events_path")
 
       for event, parsed in parsed_batch:
         pipeline.process(event.model_dump(), parsed)

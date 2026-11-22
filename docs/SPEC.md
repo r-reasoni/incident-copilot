@@ -280,11 +280,21 @@ All settings are read from environment variables or `.env`. Below is the complet
 | `HST_WINDOW_SIZE` | `int` | `100` | Sliding window size parameter for HalfSpaceTrees |
 | `THRESHOLD_LOOKBACK` | `int` | `200` | Number of historical window scores used to compute dynamic threshold |
 | `THRESHOLD_STD_MULT` | `float` | `3.0` | Multiplier for standard deviation over rolling mean for threshold |
+| `THRESHOLD_CEILING` | `float` | `0.98` | Maximum cap on dynamic anomaly threshold (scores bounded in [0, 1]) |
+| `SUSPECT_WINDOWS` | `int` | `3` | Quarantine window count following any high score to guard against threshold poisoning |
 | `CONSECUTIVE_HIGH_WINDOWS` | `int` | `2` | Number of consecutive anomalous windows required to open an incident |
 | `INCIDENT_COOLDOWN_SECONDS` | `int` | `60` | Cooldown period before a new incident can open for the same service |
 | `MAX_AGENT_TOOL_CALLS` | `int` | `5` | Maximum number of tool iterations permitted per incident investigation |
 | `DRAIN_STATE_PATH` | `str` | `data/drain_state.bin` | File path for persisting Drain3 parse tree state |
 | `METRICS_SAMPLE_SECONDS` | `int` | `5` | Interval in seconds between background host metric samples |
+| `RECORD_EVENTS_PATH` | `str` | `""` | Optional file path to stream all ingested raw events as JSON lines |
+
+### 9.1 Effective HST Window Size & Suspect Quarantine
+
+- **Effective HST Window Size**: HalfSpaceTrees scores are not meaningful until the initial reference tree mass distributions are filled. To guarantee this occurs cleanly during warm-up regardless of configuration, the effective window size is calculated as:
+  $$\text{effective\_hst\_window} = \min(\text{HST\_WINDOW\_SIZE}, \max(5, \lfloor \text{WARMUP\_WINDOWS} / 2 \rfloor))$$
+- **Suspect-Window Quarantine**: When a window scores at or above the threshold ($\text{score} \ge \text{threshold}$), the following $\text{SUSPECT\_WINDOWS}$ windows are quarantined. They are neither learned by the MinMaxScaler / HalfSpaceTrees nor added to the rolling threshold lookback history, even if their scores fall slightly below the threshold. This prevents threshold poisoning from lingering or fluctuating failure modes.
+- **Time-to-Detect & Confirmation**: Each window result provides `confirmed_at` (set on the exact window where consecutive-high requirements are first satisfied, equal to `window_end`) and `run_start` (equal to the starting timestamp of the initial high window in the run).
 
 ---
 

@@ -39,16 +39,31 @@ class Settings:
         self.hst_window_size = int(os.getenv("HST_WINDOW_SIZE", "100"))
         self.threshold_lookback = int(os.getenv("THRESHOLD_LOOKBACK", "200"))
         self.threshold_std_mult = float(os.getenv("THRESHOLD_STD_MULT", "3.0"))
+        self.threshold_ceiling = float(os.getenv("THRESHOLD_CEILING", "0.98"))
+        self.suspect_windows = int(os.getenv("SUSPECT_WINDOWS", "3"))
         self.consecutive_high_windows = int(os.getenv("CONSECUTIVE_HIGH_WINDOWS", "2"))
         self.incident_cooldown_seconds = int(os.getenv("INCIDENT_COOLDOWN_SECONDS", "60"))
         self.max_agent_tool_calls = int(os.getenv("MAX_AGENT_TOOL_CALLS", "5"))
         self.drain_state_path = os.getenv("DRAIN_STATE_PATH", "data/drain_state.bin")
         self.metrics_sample_seconds = int(os.getenv("METRICS_SAMPLE_SECONDS", "5"))
+        self.record_events_path = os.getenv("RECORD_EVENTS_PATH", "")
         self.services = [
             s.strip()
             for s in os.getenv("SERVICES", "api-service,worker-service").split(",")
             if s.strip()
         ]
+
+    @property
+    def effective_hst_window_size(self) -> int:
+        """Effective HST window size.
+
+        River HalfSpaceTrees scores are not meaningful until the first HST_WINDOW_SIZE
+        windows have been learned to populate reference tree depths and mass distributions.
+        During warm-up (WARMUP_WINDOWS), we cap the effective HST window size so the model
+        completes its reference window well before warm-up ends:
+            effective_hst_window = min(HST_WINDOW_SIZE, max(5, WARMUP_WINDOWS // 2))
+        """
+        return min(self.hst_window_size, max(5, self.warmup_windows // 2))
 
     def __getattr__(self, name: str) -> Any:
         lower = name.lower()
