@@ -20,6 +20,10 @@ FORBIDDEN_PHRASES = [
     "latency",
     "packet_loss",
     "db_lock",
+    "_fault",
+    "_internal",
+    "/health",
+    "/metrics",
 ]
 
 
@@ -113,4 +117,27 @@ def test_no_evaluation_leaks_in_source_or_logs(monkeypatch) -> None:
         for phrase in FORBIDDEN_PHRASES:
             assert phrase.lower() not in msg_lower, (
                 f"Forbidden phrase '{phrase}' emitted during fault run: {msg}"
+            )
+
+    # 3. Real test run with API service handling control, health, and fault requests
+    from fastapi.testclient import TestClient
+    import testbed.api_service as api_mod
+
+    service_logs: list[str] = []
+    monkeypatch.setattr(api_mod.shipper, "log", lambda level, msg: service_logs.append(msg))
+    monkeypatch.setattr(api_mod.faults, "_hold_database_lock", lambda: None)
+
+    with TestClient(api_mod.app) as client:
+        # Request to control and meta endpoints
+        client.get("/health")
+        client.get("/metrics")
+        client.post("/_fault/start", json={"type": "latency", "params": {"delay_ms": 10}})
+        client.post("/_fault/stop")
+        client.post("/_internal/stop")
+
+    for msg in service_logs:
+        msg_lower = msg.lower()
+        for phrase in FORBIDDEN_PHRASES:
+            assert phrase.lower() not in msg_lower, (
+                f"Forbidden phrase '{phrase}' emitted in testbed service log: {msg}"
             )

@@ -59,6 +59,14 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+SKIP_LOG_PREFIXES = ("/_fault", "/_internal")
+SKIP_LOG_EXACT = {"/health", "/metrics"}
+
+
+def _should_skip_logging(path: str) -> bool:
+    return path.startswith(SKIP_LOG_PREFIXES) or path in SKIP_LOG_EXACT
+
+
 @app.middleware("http")
 async def observe_requests(request: Request, call_next):
     started = time.perf_counter()
@@ -70,28 +78,38 @@ async def observe_requests(request: Request, call_next):
                 base = float(params.get("delay_ms", 800))
                 spread = float(params.get("jitter_ms", 200))
                 await asyncio.sleep(max(0, RANDOM.uniform(base - spread, base + spread)) / 1000)
+            elif kind == "cpu_hog":
+                delay_ms = RANDOM.uniform(100, 600)
+                cycle_start = time.perf_counter()
+                val = 1
+                while (time.perf_counter() - cycle_start) * 1000 < delay_ms:
+                    for n in range(1, 2000):
+                        val = (val * n) % 104729
             elif kind == "packet_loss":
                 drop_percent = max(0, min(100, float(params.get("percent", 20))))
                 if RANDOM.random() * 100 < drop_percent:
                     await asyncio.sleep(max(2.2, float(params.get("timeout_seconds", 2.2))))
                     elapsed = (time.perf_counter() - started) * 1000
                     _record_request(elapsed, 504)
-                    shipper.log("ERROR", "Request timed out waiting for an upstream response")
+                    if not _should_skip_logging(path):
+                        shipper.log("ERROR", "Request timed out waiting for an upstream response")
                     return _json_error(504, "upstream request timed out")
         response = await call_next(request)
         elapsed = (time.perf_counter() - started) * 1000
         _record_request(elapsed, response.status_code)
-        if elapsed > 500:
-            shipper.log("WARN", f"Slow request {request.method} {path} completed in {elapsed:.0f}ms")
-        elif response.status_code >= 500:
-            shipper.log("ERROR", f"Request {request.method} {path} returned {response.status_code}")
-        else:
-            shipper.log("INFO", f"Request {request.method} {path} completed in {elapsed:.0f}ms")
+        if not _should_skip_logging(path):
+            if elapsed > 500:
+                shipper.log("WARN", f"Slow request {request.method} {path} completed in {elapsed:.0f}ms")
+            elif response.status_code >= 500:
+                shipper.log("ERROR", f"Request {request.method} {path} returned {response.status_code}")
+            else:
+                shipper.log("INFO", f"Request {request.method} {path} completed in {elapsed:.0f}ms")
         return response
     except Exception as error:
         elapsed = (time.perf_counter() - started) * 1000
         _record_request(elapsed, 500)
-        shipper.log("ERROR", f"Request handler failed with {type(error).__name__}")
+        if not _should_skip_logging(path):
+            shipper.log("ERROR", f"Request handler failed with {type(error).__name__}")
         raise
 
 
