@@ -43,6 +43,7 @@ class Settings:
         self.suspect_windows = int(os.getenv("SUSPECT_WINDOWS", "3"))
         self.consecutive_high_windows = int(os.getenv("CONSECUTIVE_HIGH_WINDOWS", "2"))
         self.incident_cooldown_seconds = int(os.getenv("INCIDENT_COOLDOWN_SECONDS", "60"))
+        self.evidence_max_seconds = int(os.getenv("EVIDENCE_MAX_SECONDS", "300"))
         self.max_agent_tool_calls = int(os.getenv("MAX_AGENT_TOOL_CALLS", "5"))
         self.drain_state_path = os.getenv("DRAIN_STATE_PATH", "data/drain_state.bin")
         self.metrics_sample_seconds = int(os.getenv("METRICS_SAMPLE_SECONDS", "5"))

@@ -359,3 +359,133 @@ def test_api_incidents_endpoints() -> None:
     assert "incidents" in stats_data
     assert "total_windows" in stats_data
     assert stats_data["incidents"] >= 1
+
+
+def test_quiet_window_baseline_excludes_earlier_incident_and_quarantine() -> None:
+    """Quiet-window baseline must exclude earlier incidents, their 60s cooldown, and suspect quarantine."""
+    manager = IncidentManager(persist=False, anomaly_gap_seconds=30, incident_cooldown_seconds=60)
+    base_t = datetime(2026, 11, 23, 10, 0, 0, tzinfo=UTC)
+
+    # 1. 10 initial quiet windows (10:00:00 to 10:01:40)
+    for i in range(10):
+        w = _make_window(base_t + timedelta(seconds=10 * i), is_anomalous=False, score=0.1)
+        manager.on_window(w)
+
+    # 2. First incident: 10:01:40 to 10:02:10 (3 anomalous windows)
+    t1_start = base_t + timedelta(seconds=100)
+    for i in range(3):
+        w = _make_window(
+            t1_start + timedelta(seconds=10 * i),
+            is_anomalous=True,
+            score=0.9,
+            run_start=t1_start,
+        )
+        manager.on_window(w)
+
+    # Tick to close incident 1 at 10:02:10 + 35s = 10:02:45
+    manager.tick(t1_start + timedelta(seconds=30 + 35))
+    inc1 = manager.get_incident(1)
+    assert inc1 is not None
+    assert inc1.status == "closed"
+    assert inc1.ended_at == t1_start + timedelta(seconds=30)  # 10:02:10
+
+    # 3. Windows in cooldown period (10:02:10 to 10:03:10, within 60s of inc1 end)
+    # These must NOT be used as quiet baseline windows for inc2!
+    for i in range(6):
+        w = _make_window(inc1.ended_at + timedelta(seconds=10 * i), is_anomalous=False, score=0.1)
+        manager.on_window(w)
+
+    # 4. Clean quiet windows post-cooldown (10:03:10 to 10:05:00, 11 windows)
+    post_cool = inc1.ended_at + timedelta(seconds=60)
+    for i in range(11):
+        w = _make_window(post_cool + timedelta(seconds=10 * i), is_anomalous=False, score=0.1)
+        manager.on_window(w)
+
+    # 5. Second incident starts at 10:05:00
+    t2_start = post_cool + timedelta(seconds=110)
+    for i in range(3):
+        w = _make_window(
+            t2_start + timedelta(seconds=10 * i),
+            is_anomalous=True,
+            score=0.92,
+            run_start=t2_start,
+        )
+        manager.on_window(w)
+
+    manager.flush()
+    inc2 = manager.get_incident(2)
+    assert inc2 is not None
+    assert inc2.status == "closed"
+
+    pack = build_evidence_pack(inc2)
+    assert "baseline_source" in pack
+    assert "baseline_window_count" in pack
+    assert pack["baseline_window_count"] >= 4
+    assert pack["baseline_source"] == "recent"
+
+    # Verify that quiet windows for incident 2 do not overlap incident 1 or its 60s cooldown
+    quiet_wins, src, count = manager._get_quiet_windows(inc2)
+    inc1_excl_end = inc1.ended_at + timedelta(seconds=60)
+    for qw in quiet_wins:
+        assert qw["w_start"] >= inc1_excl_end or qw["w_end"] <= inc1.started_at
+
+
+def test_evidence_interval_cap() -> None:
+    """Incident metrics and top_templates aggregation cap evidence at EVIDENCE_MAX_SECONDS (300s)."""
+    manager = IncidentManager(persist=False, anomaly_gap_seconds=30, incident_cooldown_seconds=60)
+    manager.evidence_max_seconds = 300
+    base_t = datetime(2026, 11, 23, 10, 0, 0, tzinfo=UTC)
+
+    # Baseline quiet windows
+    for i in range(12):
+        w = _make_window(base_t + timedelta(seconds=10 * i), is_anomalous=False, score=0.1)
+        manager.on_window(w)
+
+    t_start = base_t + timedelta(seconds=120)
+
+    # Incident logs:
+    # Template 101 emits 10 errors inside first 300s (e.g. at t_start + 50s)
+    for _ in range(10):
+        manager.record_log({
+            "ts": (t_start + timedelta(seconds=50)).isoformat(),
+            "service": "api-service",
+            "level": "ERROR",
+            "message": "Error inside evidence interval cap",
+        }, parsed=type("Parsed", (), {"template_id": 101, "template": "Error inside evidence interval cap"})())
+
+    # Template 102 emits 100 errors AFTER 300s (at t_start + 450s)
+    for _ in range(100):
+        manager.record_log({
+            "ts": (t_start + timedelta(seconds=450)).isoformat(),
+            "service": "api-service",
+            "level": "ERROR",
+            "message": "Late error after evidence interval cap",
+        }, parsed=type("Parsed", (), {"template_id": 102, "template": "Late error after evidence interval cap"})())
+
+    # Incident spans 60 windows = 600 seconds
+    for i in range(60):
+        w = _make_window(
+            t_start + timedelta(seconds=10 * i),
+            is_anomalous=True,
+            score=0.95,
+            run_start=t_start,
+        )
+        manager.on_window(w)
+
+    manager.flush()
+    inc = manager.get_incident(1)
+    assert inc is not None
+    # Incident true duration is 600s
+    true_dur = (inc.ended_at - inc.started_at).total_seconds()
+    assert true_dur == 600.0
+
+    # But template 102 (which only occurred at +450s) must NOT dominate or appear above template 101
+    # Because evidence aggregation was capped at 300s!
+    tpl_ids = [t["template_id"] for t in inc.top_templates]
+    assert 101 in tpl_ids
+    assert 102 not in tpl_ids
+
+    pack = build_evidence_pack(inc)
+    assert pack["duration_seconds"] == 600.0
+    assert "baseline_source" in pack
+    assert "baseline_window_count" in pack

@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
-from sqlalchemy import func, select, text
+from sqlalchemy import and_, func, or_, select, text
 
 from app.config import settings
 from app.db import repository
@@ -77,6 +77,8 @@ class IncidentRecord:
     top_templates: list[dict[str, Any]] = field(default_factory=list)
     comparison: dict[str, Any] = field(default_factory=dict)
     alternatives: Any = None
+    baseline_source: str = "recent"
+    baseline_window_count: int = 0
     windows: list[Any] = field(default_factory=list)
     anomalous_windows: list[Any] = field(default_factory=list)
     baseline_windows: list[Any] = field(default_factory=list)
@@ -117,6 +119,9 @@ class IncidentManager:
             if incident_cooldown_seconds is not None
             else getattr(settings, "incident_cooldown_seconds", 60)
         )
+        self.evidence_max_seconds = getattr(settings, "evidence_max_seconds", 300)
+        self.suspect_windows = getattr(settings, "suspect_windows", 3)
+        self.warmup_windows = getattr(settings, "warmup_windows", 30)
         self.persist = persist
         self.agent_hook = agent_hook or default_agent_hook
         self.broadcast_callback = broadcast_callback
@@ -138,6 +143,7 @@ class IncidentManager:
         # In-memory log buffer for fallback offline aggregation when persist=False
         self._in_memory_logs: list[dict[str, Any]] = []
         self._in_memory_windows: list[Any] = []
+        self._all_windows: list[Any] = []
 
         # Stats counters
         self.total_log_lines: int = 0
@@ -222,6 +228,7 @@ class IncidentManager:
             confirmed_at_dt = _parse_ts(confirmed_at) if confirmed_at else w_end
 
             self._update_watermark(w_end)
+            self._all_windows.append(window)
             if not self.persist:
                 self._in_memory_windows.append(window)
 
@@ -508,42 +515,189 @@ class IncidentManager:
             "comparison": incident.comparison,
             "peak_features": incident.peak_features,
             "affected_services_rates": incident.affected_services_rates,
+            "baseline_source": incident.baseline_source,
+            "baseline_window_count": incident.baseline_window_count,
         }
+
+    def _get_quiet_windows(self, incident: IncidentRecord) -> tuple[list[dict[str, Any]], str, int]:
+        """Identify quiet windows before incident.started_at.
+
+        A window is quiet if:
+        - not flagged (is_anomalous == False)
+        - not in suspect-window quarantine (neither high score nor within suspect_windows after high score)
+        - not within 60 seconds after the end of any earlier incident (and not during any earlier incident)
+        - window_end <= incident.started_at
+        """
+        all_windows = list(self._all_windows)
+        if self.persist and len(all_windows) < 10:
+            try:
+                with self.session_factory() as session:
+                    db_wins = session.scalars(
+                        select(WindowScore).order_by(WindowScore.window_start.asc())
+                    ).all()
+                    if db_wins:
+                        all_windows = list(db_wins)
+            except Exception:
+                pass
+
+        # Identify intervals of earlier incidents (plus 60s cooldown)
+        earlier_exclusions: list[tuple[datetime, datetime]] = []
+        with self._lock:
+            all_incidents = list(self._incidents.values())
+        if self.persist:
+            try:
+                with self.session_factory() as session:
+                    db_incs = repository.list_incidents(session)
+                    for dbi in db_incs:
+                        if dbi.id != incident.id:
+                            s = dbi.started_at
+                            e = (dbi.ended_at or s) + timedelta(seconds=60)
+                            earlier_exclusions.append((s, e))
+            except Exception:
+                pass
+        for inc in all_incidents:
+            if inc.id != incident.id:
+                s = inc.started_at
+                e = (inc.ended_at or inc.last_anomalous_end or s) + timedelta(seconds=60)
+                earlier_exclusions.append((s, e))
+
+        quarantine_remaining = 0
+        annotated: list[dict[str, Any]] = []
+        for idx, w in enumerate(all_windows):
+            w_start = _parse_ts(_get_window_field(w, "window_start"))
+            w_end = _parse_ts(_get_window_field(w, "window_end"))
+            is_anom = bool(_get_window_field(w, "is_anomalous", False))
+            score = float(_get_window_field(w, "score", 0.0))
+            raw_feats = dict(_get_window_field(w, "features", {}))
+            raw_thresh = raw_feats.get("_threshold")
+            if raw_thresh is None:
+                raw_thresh = _get_window_field(w, "threshold")
+            thresh = float(raw_thresh) if raw_thresh is not None else 1.0
+
+            in_quarantine = (quarantine_remaining > 0)
+            is_high = (score >= thresh) or is_anom
+
+            if is_high:
+                quarantine_remaining = self.suspect_windows
+            elif quarantine_remaining > 0:
+                quarantine_remaining -= 1
+
+            in_earlier = any(
+                (w_start < excl_end and w_end > excl_start)
+                for excl_start, excl_end in earlier_exclusions
+            )
+
+            is_quiet = (not is_anom) and (not is_high) and (not in_quarantine) and (not in_earlier)
+
+            annotated.append({
+                "index": idx,
+                "w_start": w_start,
+                "w_end": w_end,
+                "score": score,
+                "threshold": thresh,
+                "is_anomalous": is_anom,
+                "is_high": is_high,
+                "in_quarantine": in_quarantine,
+                "in_earlier": in_earlier,
+                "is_quiet": is_quiet,
+                "features": raw_feats,
+            })
+
+        candidate_quiet = [
+            aw for aw in annotated
+            if aw["w_end"] <= incident.started_at and aw["is_quiet"]
+        ]
+
+        recent_quiet = candidate_quiet[-12:]
+        if len(recent_quiet) >= 4:
+            return recent_quiet, "recent", len(recent_quiet)
+
+        post_warmup_quiet = [
+            aw for aw in annotated
+            if aw["index"] >= self.warmup_windows and aw["is_quiet"]
+        ]
+        ref_before = [aw for aw in post_warmup_quiet if aw["w_end"] <= incident.started_at]
+        if len(ref_before) >= 4:
+            ref_selected = ref_before[:12]
+        elif post_warmup_quiet:
+            ref_selected = post_warmup_quiet[:12]
+        else:
+            ref_selected = recent_quiet if recent_quiet else candidate_quiet
+
+        return ref_selected, "reference", len(ref_selected)
 
     def _compute_metrics(self, incident: IncidentRecord) -> None:
         """Compute affected_services and top_templates via SQL aggregation (or in-memory fallback)."""
         started_at = incident.started_at
         ended_at = incident.ended_at or incident.last_anomalous_end
-        baseline_start = started_at - timedelta(seconds=120)
-        baseline_dur = 120.0
-        incident_dur = max((ended_at - started_at).total_seconds(), 1.0)
+
+        # 1. Cap evidence interval at EVIDENCE_MAX_SECONDS (default 300s)
+        evidence_end = min(ended_at, started_at + timedelta(seconds=self.evidence_max_seconds))
+        incident_dur = max((evidence_end - started_at).total_seconds(), 1.0)
+
+        # 2. Quiet-window baseline
+        quiet_windows, baseline_source, baseline_count = self._get_quiet_windows(incident)
+        incident.baseline_source = baseline_source
+        incident.baseline_window_count = baseline_count
+
+        if quiet_windows:
+            baseline_intervals = [(w["w_start"], w["w_end"]) for w in quiet_windows]
+            baseline_dur = max(sum((we - ws).total_seconds() for ws, we in baseline_intervals), 1.0)
+        else:
+            baseline_intervals = [(started_at - timedelta(seconds=120), started_at)]
+            baseline_dur = 120.0
 
         if self.persist:
             try:
-                self._compute_metrics_sql(incident, started_at, ended_at, baseline_start, baseline_dur, incident_dur)
+                self._compute_metrics_sql(
+                    incident,
+                    started_at,
+                    ended_at,
+                    evidence_end,
+                    baseline_intervals,
+                    baseline_dur,
+                    incident_dur,
+                    quiet_windows,
+                )
                 return
             except Exception:
                 logger.exception("SQL metric computation failed, falling back to in-memory")
 
-        self._compute_metrics_in_memory(incident, started_at, ended_at, baseline_start, baseline_dur, incident_dur)
+        self._compute_metrics_in_memory(
+            incident,
+            started_at,
+            ended_at,
+            evidence_end,
+            baseline_intervals,
+            baseline_dur,
+            incident_dur,
+            quiet_windows,
+        )
 
     def _compute_metrics_sql(
         self,
         incident: IncidentRecord,
         started_at: datetime,
         ended_at: datetime,
-        baseline_start: datetime,
+        evidence_end: datetime,
+        baseline_intervals: list[tuple[datetime, datetime]],
         baseline_dur: float,
         incident_dur: float,
+        quiet_windows: list[dict[str, Any]],
     ) -> None:
         with self.session_factory() as session:
-            # 1. Affected services: WARN+ERROR counts in incident vs 120s baseline
-            # A service is affected if its rate at least doubles
+            # Baseline time filter across quiet window intervals
+            base_time_filter = or_(*[
+                and_(LogEvent.ts >= ws, LogEvent.ts < we)
+                for ws, we in baseline_intervals
+            ])
+
+            # 1. Affected services: WARN+ERROR counts in evidence interval vs quiet baseline
             inc_err_stmt = (
                 select(LogEvent.service, func.count().label("cnt"))
                 .where(
                     LogEvent.ts >= started_at,
-                    LogEvent.ts <= ended_at,
+                    LogEvent.ts <= evidence_end,
                     LogEvent.level.in_(["WARN", "WARNING", "ERROR", "CRITICAL"]),
                 )
                 .group_by(LogEvent.service)
@@ -551,8 +705,7 @@ class IncidentManager:
             base_err_stmt = (
                 select(LogEvent.service, func.count().label("cnt"))
                 .where(
-                    LogEvent.ts >= baseline_start,
-                    LogEvent.ts < started_at,
+                    base_time_filter,
                     LogEvent.level.in_(["WARN", "WARNING", "ERROR", "CRITICAL"]),
                 )
                 .group_by(LogEvent.service)
@@ -579,12 +732,11 @@ class IncidentManager:
             incident.affected_services_rates = affected_rates
 
             # 2. Top templates (max 8) via SQL aggregation
-            # Level mix and incident counts
             tpl_inc_stmt = (
                 select(LogEvent.template_id, LogEvent.level, func.count().label("cnt"))
                 .where(
                     LogEvent.ts >= started_at,
-                    LogEvent.ts <= ended_at,
+                    LogEvent.ts <= evidence_end,
                     LogEvent.template_id.isnot(None),
                 )
                 .group_by(LogEvent.template_id, LogEvent.level)
@@ -600,8 +752,7 @@ class IncidentManager:
             tpl_base_stmt = (
                 select(LogEvent.template_id, func.count().label("cnt"))
                 .where(
-                    LogEvent.ts >= baseline_start,
-                    LogEvent.ts < started_at,
+                    base_time_filter,
                     LogEvent.template_id.isnot(None),
                 )
                 .group_by(LogEvent.template_id)
@@ -622,15 +773,14 @@ class IncidentManager:
                 )
                 prior_counts = dict(session.execute(prior_stmt).all())
 
-            # Up to 3 example raw lines
+            # Up to 3 example raw lines (capped at evidence_end)
             example_lines: dict[int, list[str]] = defaultdict(list)
             if all_candidate_tids:
-                # Fetch recent distinct log messages for each candidate template
                 sample_stmt = (
                     select(LogEvent.template_id, LogEvent.raw_message)
                     .where(
                         LogEvent.ts >= started_at,
-                        LogEvent.ts <= ended_at,
+                        LogEvent.ts <= evidence_end,
                         LogEvent.template_id.in_(all_candidate_tids),
                     )
                     .order_by(LogEvent.id.desc())
@@ -678,15 +828,15 @@ class IncidentManager:
             incident.top_templates = [{k: v for k, v in t.items() if k != "_sort_key"} for t in top_items[:8]]
 
             # 3. Baseline vs incident summary from window_scores
-            base_win_stmt = select(WindowScore.features).where(
-                WindowScore.window_start >= baseline_start,
-                WindowScore.window_end <= started_at,
-            )
+            base_win_feats = [w.get("features", {}) for w in quiet_windows if isinstance(w, dict)]
+            if not base_win_feats and baseline_intervals:
+                base_win_stmt = select(WindowScore.features).where(base_time_filter)
+                base_win_feats = session.scalars(base_win_stmt).all()
+
             inc_win_stmt = select(WindowScore.features).where(
                 WindowScore.window_start >= started_at,
-                WindowScore.window_end <= ended_at + timedelta(seconds=15),
+                WindowScore.window_end <= evidence_end + timedelta(seconds=15),
             )
-            base_win_feats = session.scalars(base_win_stmt).all()
             inc_win_feats = session.scalars(inc_win_stmt).all()
 
             comparison = {}
@@ -706,11 +856,16 @@ class IncidentManager:
         incident: IncidentRecord,
         started_at: datetime,
         ended_at: datetime,
-        baseline_start: datetime,
+        evidence_end: datetime,
+        baseline_intervals: list[tuple[datetime, datetime]],
         baseline_dur: float,
         incident_dur: float,
+        quiet_windows: list[dict[str, Any]],
     ) -> None:
         """In-memory aggregation fallback for unit tests and offline environments."""
+        def is_in_quiet(ts: datetime) -> bool:
+            return any(ws <= ts < we for ws, we in baseline_intervals)
+
         # 1. Affected services
         base_errs: Counter[str] = Counter()
         inc_errs: Counter[str] = Counter()
@@ -719,9 +874,9 @@ class IncidentManager:
             lvl = e["level"]
             svc = e["service"]
             if lvl in ("WARN", "WARNING", "ERROR", "CRITICAL"):
-                if baseline_start <= ts < started_at:
+                if is_in_quiet(ts):
                     base_errs[svc] += 1
-                elif started_at <= ts <= ended_at:
+                elif started_at <= ts <= evidence_end:
                     inc_errs[svc] += 1
 
         candidate_services = sorted(set(list(inc_errs.keys()) + list(base_errs.keys()) + self.services))
@@ -759,9 +914,9 @@ class IncidentManager:
 
             if ts < started_at:
                 prior_tpl_counts[tid] += 1
-                if baseline_start <= ts:
+                if is_in_quiet(ts):
                     base_tpl_counts[tid] += 1
-            elif started_at <= ts <= ended_at:
+            elif started_at <= ts <= evidence_end:
                 inc_tpl_counts[tid] += 1
                 level_mix[tid][lvl] += 1
                 if len(example_lines[tid]) < 3 and msg not in example_lines[tid]:
@@ -793,12 +948,15 @@ class IncidentManager:
         incident.top_templates = [{k: v for k, v in t.items() if k != "_sort_key"} for t in top_items[:8]]
 
         # 3. Window score summary
-        base_wins = [w for w in self._in_memory_windows if baseline_start <= _parse_ts(_get_window_field(w, "window_start")) < started_at]
-        inc_wins = [w for w in self._in_memory_windows if started_at <= _parse_ts(_get_window_field(w, "window_start")) <= ended_at]
+        base_win_feats = [w.get("features", {}) for w in quiet_windows if isinstance(w, dict)]
+        inc_wins = [
+            w for w in (self._in_memory_windows or self._all_windows)
+            if started_at <= _parse_ts(_get_window_field(w, "window_start")) <= evidence_end
+        ]
 
         comparison = {}
         for metric in ("log_rate", "error_rate", "warn_rate", "duration_mean_ms", "duration_p95_ms"):
-            b_vals = [_get_window_field(w, "features", {}).get(metric, 0.0) for w in base_wins]
+            b_vals = [f.get(metric, 0.0) for f in base_win_feats if isinstance(f, dict)]
             i_vals = [_get_window_field(w, "features", {}).get(metric, 0.0) for w in inc_wins]
             b_m = sum(b_vals) / len(b_vals) if b_vals else 0.0
             i_m = sum(i_vals) / len(i_vals) if i_vals else 0.0
@@ -887,6 +1045,8 @@ class IncidentManager:
             top_templates=top_list,
             comparison=comp,
             alternatives=db_inc.alternatives,
+            baseline_source=top_data.get("baseline_source", "recent") if isinstance(top_data, dict) else "recent",
+            baseline_window_count=top_data.get("baseline_window_count", 0) if isinstance(top_data, dict) else 0,
             llm_calls=db_inc.llm_calls or 0,
             created_at=db_inc.created_at,
             analyzed_at=db_inc.analyzed_at,

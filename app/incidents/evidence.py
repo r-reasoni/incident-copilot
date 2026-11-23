@@ -50,7 +50,7 @@ def build_evidence_pack(
     """Build a compact evidence pack JSON dict for an incident under 2000 tokens (~8000 chars)."""
     incident: Any = None
 
-    if isinstance(incident_id, (IncidentRecord, dict)):
+    if isinstance(incident_id, (IncidentRecord, dict)) or hasattr(incident_id, "top_templates"):
         incident = incident_id
     elif manager is not None:
         incident = manager.get_incident(int(incident_id))
@@ -75,17 +75,26 @@ def build_evidence_pack(
     ended_at = getattr(incident, "ended_at", None) or (incident.get("ended_at") if isinstance(incident, dict) else None)
     peak_score = getattr(incident, "peak_score", 0.0) or (incident.get("peak_score", 0.0) if isinstance(incident, dict) else 0.0)
 
-    top_raw = getattr(incident, "top_templates", {}) or (incident.get("top_templates", {}) if isinstance(incident, dict) else {})
-    if isinstance(top_raw, dict):
+    top_raw = getattr(incident, "top_templates", None)
+    if top_raw is None and isinstance(incident, dict):
+        top_raw = incident.get("top_templates")
+    if top_raw is None:
+        top_raw = {}
+
+    if isinstance(top_raw, dict) and top_raw:
         top_templates = top_raw.get("top_templates") or top_raw.get("templates") or []
         comparison = top_raw.get("comparison") or {}
         peak_features = top_raw.get("peak_features") or {}
         affected_rates = top_raw.get("affected_services_rates") or []
+        baseline_source = top_raw.get("baseline_source") or getattr(incident, "baseline_source", "recent")
+        baseline_window_count = top_raw.get("baseline_window_count") if "baseline_window_count" in top_raw else getattr(incident, "baseline_window_count", 0)
     else:
-        top_templates = list(top_raw)
+        top_templates = list(top_raw) if isinstance(top_raw, (list, tuple)) else []
         comparison = getattr(incident, "comparison", {}) or {}
         peak_features = getattr(incident, "peak_features", {}) or {}
         affected_rates = getattr(incident, "affected_services_rates", []) or []
+        baseline_source = getattr(incident, "baseline_source", "recent")
+        baseline_window_count = getattr(incident, "baseline_window_count", 0)
 
     # Clean peak features: remove underscore keys
     clean_peak_features = {k: v for k, v in peak_features.items() if not k.startswith("_")}
@@ -129,6 +138,8 @@ def build_evidence_pack(
         "duration_seconds": duration_sec,
         "peak_score": round(float(peak_score), 4),
         "affected_services": affected_rates or getattr(incident, "affected_services", []),
+        "baseline_source": baseline_source,
+        "baseline_window_count": baseline_window_count,
         "baseline_vs_incident": comparison,
         "top_templates": capped_templates,
         "peak_window_features": clean_peak_features,

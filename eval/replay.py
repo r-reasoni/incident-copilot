@@ -46,10 +46,33 @@ def replay(
     events_path: Path,
     faults_path: Path | None = None,
     batch_size: int = 100,
+    truncate_after_faults: int = 150,
 ) -> list[Any]:
-    """Execute event-time replay of recorded logs through ingest_batch."""
+    """Execute event-time replay of recorded logs through ingest_batch.
+
+    Note:
+        When --faults is provided, events arriving more than truncate_after_faults seconds
+        after the last injected fault ends are discarded. Trailing silence after an experiment
+        is not part of the evaluation.
+    """
     truncate_replay_tables()
     reset_drain_state()
+
+    # Pre-parse faults if provided to determine truncation cutoff
+    faults: list[dict[str, Any]] = []
+    cutoff_ts: datetime | None = None
+    if faults_path and faults_path.exists():
+        with faults_path.open("r", encoding="utf-8") as f:
+            faults = json.load(f)
+        if faults:
+            max_fault_end = max(
+                _parse_event_ts(flt["ended_at"])
+                if flt.get("ended_at")
+                else _parse_event_ts(flt["started_at"]) + timedelta(seconds=60)
+                for flt in faults
+            )
+            cutoff_ts = max_fault_end + timedelta(seconds=truncate_after_faults)
+            print(f"Faults loaded ({len(faults)}). Evaluation cutoff at {cutoff_ts.isoformat()} (+{truncate_after_faults}s).")
 
     parser = LogParser()
     incident_manager = IncidentManager()
@@ -60,6 +83,7 @@ def replay(
     batch: list[dict[str, Any]] = []
     last_tick_ts: datetime | None = None
     total_events = 0
+    dropped_events = 0
 
     with events_path.open("r", encoding="utf-8") as f:
         for line in f:
@@ -68,6 +92,11 @@ def replay(
                 continue
             event = json.loads(line)
             ts = _parse_event_ts(event["ts"])
+
+            if cutoff_ts is not None and ts > cutoff_ts:
+                dropped_events += 1
+                continue
+
             total_events += 1
 
             if last_tick_ts is None or (ts - last_tick_ts).total_seconds() >= 1.0:
@@ -82,17 +111,15 @@ def replay(
     if batch:
         ingest_batch(batch, parser=parser, pipeline=pipeline)
 
+    if dropped_events > 0:
+        print(f"Truncated after faults: dropped {dropped_events} trailing events after {cutoff_ts.isoformat()}.")
+        print("Note: Trailing silence after an experiment is not part of the evaluation.")
+
     print(f"Replayed {total_events} events. Flushing pipeline...")
     pipeline.flush()
 
     incidents = incident_manager.list_incidents()
     print(f"\nReplay complete. Found {len(incidents)} incidents.")
-
-    # Match against faults if provided
-    faults: list[dict[str, Any]] = []
-    if faults_path and faults_path.exists():
-        with faults_path.open("r", encoding="utf-8") as f:
-            faults = json.load(f)
 
     print_incident_table(incidents, faults)
     return incidents
@@ -181,6 +208,12 @@ def main() -> None:
     parser.add_argument("--faults", type=Path, default=None, help="Optional path to faults.json")
     parser.add_argument("--yes", action="store_true", help="Confirm table truncation")
     parser.add_argument("--batch-size", type=int, default=100, help="Batch size for ingestion")
+    parser.add_argument(
+        "--truncate-after-faults",
+        type=int,
+        default=150,
+        help="Stop feeding events SECONDS after last fault ended (default: 150)",
+    )
 
     args = parser.parse_args()
     if not args.yes:
@@ -191,7 +224,12 @@ def main() -> None:
         print(f"ERROR: Events file not found at {args.events}", file=sys.stderr)
         sys.exit(1)
 
-    replay(args.events, faults_path=args.faults, batch_size=args.batch_size)
+    replay(
+        args.events,
+        faults_path=args.faults,
+        batch_size=args.batch_size,
+        truncate_after_faults=args.truncate_after_faults,
+    )
 
 
 if __name__ == "__main__":
