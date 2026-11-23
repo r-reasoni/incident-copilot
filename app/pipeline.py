@@ -14,25 +14,31 @@ from app.detection.detector import AnomalyDetector, WindowResult
 from app.detection.windowing import WindowAggregator
 
 if TYPE_CHECKING:
+    from app.incidents.manager import IncidentManager
     from app.parsing.parser import LogParser, ParsedLog
 
 
 class Pipeline:
-    """Ingestion pipeline orchestrating parsing, window feature extraction, and anomaly scoring."""
+    """Ingestion pipeline orchestrating parsing, window feature extraction, anomaly scoring, and incident grouping."""
 
     def __init__(
         self,
         parser: LogParser | None = None,
         aggregator: WindowAggregator | None = None,
         detector: AnomalyDetector | None = None,
+        incident_manager: IncidentManager | None = None,
         on_window: list[Callable[[WindowResult], None]] | None = None,
     ) -> None:
         self.parser = parser
         self.aggregator = aggregator or WindowAggregator()
         self.detector = detector or AnomalyDetector()
+        self.incident_manager = incident_manager
         self.on_window: list[Callable[[WindowResult], None]] = (
-            on_window if on_window is not None else []
+            list(on_window) if on_window is not None else []
         )
+        if self.incident_manager is not None and self.incident_manager.on_window not in self.on_window:
+            self.on_window.append(self.incident_manager.on_window)
+
         self._counts: Counter[str] = Counter()
         self._lock = Lock()
         self._last_tick: datetime | None = None
@@ -40,9 +46,11 @@ class Pipeline:
         self._flushed: bool = False
 
     def process(self, event: dict[str, Any], parsed: ParsedLog | None = None) -> None:
-        """Process an ingested log event through aggregation and scoring."""
+        """Process an ingested log event through aggregation, scoring, and incident tracking."""
         with self._lock:
             self._counts[event.get("service", "unknown")] += 1
+            if self.incident_manager is not None:
+                self.incident_manager.record_log(event, parsed)
             closed_windows = self.aggregator.add(event, parsed)
             for window in closed_windows:
                 result = self.detector.score_window(window)
@@ -65,6 +73,8 @@ class Pipeline:
                         callback(result)
                     except Exception:
                         pass
+            if self.incident_manager is not None:
+                self.incident_manager.tick(now)
 
     def flush(self) -> None:
         """Close everything (end of replay / shutdown)."""
@@ -78,6 +88,8 @@ class Pipeline:
                         callback(result)
                     except Exception:
                         pass
+            if self.incident_manager is not None:
+                self.incident_manager.flush()
             if self.parser is not None:
                 self.parser.save()
 
@@ -100,8 +112,3 @@ class Pipeline:
     def is_flushed(self) -> bool:
         with self._lock:
             return self._flushed
-
-    @property
-    def windows_scored(self) -> int:
-        with self._lock:
-            return self.detector.windows_scored

@@ -17,6 +17,8 @@ from app.config import settings
 from app.db.models import Incident, LogEvent, Template, WindowScore
 from app.db.repository import insert_logs, list_incidents, upsert_templates
 from app.db.session import SessionLocal
+from app.incidents.manager import IncidentManager
+from app.ingest import ingest_batch
 from app.parsing import LogParser, ParsedLog
 from app.pipeline import Pipeline
 
@@ -77,46 +79,6 @@ async def _ingest_consumer(application: FastAPI) -> None:
         break
 
     try:
-      parsed_batch: list[tuple[LogEventInput, ParsedLog]] = []
-      for event in batch:
-        parsed = parser.parse(event.message)
-        parsed_batch.append((event, parsed))
-
-      log_records = [
-        {
-          "ts": event.ts,
-          "service": event.service,
-          "host": event.host,
-          "level": event.level,
-          "raw_message": event.message,
-          "template_id": parsed.template_id,
-          "params": {
-            "values": parsed.params,
-            "duration_ms": parsed.duration_ms,
-          },
-        }
-        for event, parsed in parsed_batch
-      ]
-
-      template_aggregates: dict[int, dict[str, Any]] = {}
-      for event, parsed in parsed_batch:
-        tid = parsed.template_id
-        if tid not in template_aggregates:
-          template_aggregates[tid] = {
-            "template_id": tid,
-            "template_text": parsed.template_text,
-            "first_seen": event.ts,
-            "count": 0,
-          }
-        template_aggregates[tid]["count"] += 1
-        template_aggregates[tid]["template_text"] = parsed.template_text
-        if event.ts < template_aggregates[tid]["first_seen"]:
-          template_aggregates[tid]["first_seen"] = event.ts
-
-      with SessionLocal() as session, session.begin():
-        insert_logs(session, log_records)
-        upsert_templates(session, list(template_aggregates.values()))
-
       record_path = getattr(settings, "record_events_path", "")
       if record_path:
         try:
@@ -135,8 +97,7 @@ async def _ingest_consumer(application: FastAPI) -> None:
         except Exception:
           logger.exception("Failed to write ingested events to record_events_path")
 
-      for event, parsed in parsed_batch:
-        pipeline.process(event.model_dump(), parsed)
+      ingest_batch(batch, parser=parser, pipeline=pipeline)
     except Exception:
       logger.exception("Failed to persist an ingestion batch")
     finally:
@@ -161,7 +122,9 @@ async def lifespan(application: FastAPI):
   application.state.ingest_queue = asyncio.Queue(maxsize=QUEUE_MAXSIZE)
   parser = LogParser()
   application.state.parser = parser
-  application.state.pipeline = Pipeline(parser=parser)
+  incident_manager = IncidentManager(broadcast_callback=broadcast_alert)
+  application.state.incident_manager = incident_manager
+  application.state.pipeline = Pipeline(parser=parser, incident_manager=incident_manager)
   consumer = asyncio.create_task(_ingest_consumer(application))
   ticker = asyncio.create_task(_tick_worker(application))
   try:
@@ -209,14 +172,38 @@ async def ingest_logs(events: list[LogEventInput], request: Request) -> dict[str
 
 
 @app.get("/incidents", tags=["incidents"])
-def get_incidents(status: str | None = None) -> list[dict[str, Any]]:
+def get_incidents(request: Request, status: str | None = None) -> list[dict[str, Any]]:
+    manager: IncidentManager | None = getattr(request.app.state, "incident_manager", None)
+    if manager is not None and not manager.persist:
+        incidents = manager.list_incidents(status=status)
+        return [
+            {
+                "id": item.id,
+                "started_at": item.started_at,
+                "detected_at": item.detected_at,
+                "ended_at": item.ended_at,
+                "status": item.status,
+                "category": item.category,
+                "peak_score": item.peak_score,
+                "affected_services": item.affected_services,
+                "root_cause": item.root_cause,
+                "confidence": item.confidence,
+                "remediation": item.remediation,
+                "llm_calls": item.llm_calls,
+                "created_at": item.created_at,
+            }
+            for item in incidents
+        ]
+
     with SessionLocal() as session:
         return [
             {
                 "id": item.id,
                 "started_at": item.started_at,
+                "detected_at": item.detected_at,
                 "ended_at": item.ended_at,
                 "status": item.status,
+                "category": item.category,
                 "peak_score": item.peak_score,
                 "affected_services": item.affected_services,
                 "root_cause": item.root_cause,
@@ -230,40 +217,73 @@ def get_incidents(status: str | None = None) -> list[dict[str, Any]]:
 
 
 @app.get("/incidents/{incident_id}", tags=["incidents"])
-def get_incident(incident_id: int) -> dict[str, Any]:
-    with SessionLocal() as session:
-        item = session.get(Incident, incident_id)
-        if item is None:
-            raise HTTPException(status_code=404, detail="incident not found")
-        return {
-            "id": item.id,
-            "started_at": item.started_at,
-            "ended_at": item.ended_at,
-            "status": item.status,
-            "peak_score": item.peak_score,
-            "affected_services": item.affected_services,
-            "top_templates": item.top_templates,
-            "root_cause": item.root_cause,
-            "confidence": item.confidence,
-            "remediation": item.remediation,
-            "agent_trace": item.agent_trace,
-            "llm_calls": item.llm_calls,
-            "created_at": item.created_at,
-        }
+def get_incident(incident_id: int, request: Request) -> dict[str, Any]:
+    item: Any = None
+    manager: IncidentManager | None = getattr(request.app.state, "incident_manager", None)
+    if manager is not None:
+        item = manager.get_incident(incident_id)
+
+    if item is None and (manager is None or manager.persist):
+        try:
+            with SessionLocal() as session:
+                item = session.get(Incident, incident_id)
+        except Exception:
+            pass
+
+    if item is None:
+        raise HTTPException(status_code=404, detail="incident not found")
+
+    top_raw = getattr(item, "top_templates", {})
+    if isinstance(top_raw, dict):
+        top_templates = top_raw.get("top_templates") or top_raw.get("templates") or top_raw
+    else:
+        top_templates = top_raw
+
+    return {
+        "id": item.id,
+        "started_at": item.started_at,
+        "detected_at": getattr(item, "detected_at", None),
+        "ended_at": item.ended_at,
+        "analyzed_at": getattr(item, "analyzed_at", None),
+        "status": item.status,
+        "category": getattr(item, "category", None),
+        "peak_score": item.peak_score,
+        "affected_services": item.affected_services,
+        "top_templates": top_templates,
+        "alternatives": getattr(item, "alternatives", None),
+        "root_cause": getattr(item, "root_cause", None),
+        "confidence": getattr(item, "confidence", None),
+        "remediation": getattr(item, "remediation", None),
+        "agent_trace": getattr(item, "agent_trace", None),
+        "llm_calls": getattr(item, "llm_calls", 0),
+        "created_at": item.created_at,
+    }
 
 
 @app.get("/stats", tags=["meta"])
-def stats() -> dict[str, int]:
+def stats(request: Request) -> dict[str, int]:
+    manager: IncidentManager | None = getattr(request.app.state, "incident_manager", None)
+    if manager is not None and not manager.persist:
+        return manager.stats
+
     with SessionLocal() as session:
+        logs_count = session.scalar(select(func.count()).select_from(LogEvent)) or 0
+        templates_count = session.scalar(select(func.count()).select_from(Template)) or 0
+        windows_count = session.scalar(select(func.count()).select_from(WindowScore)) or 0
+        incidents_count = session.scalar(select(func.count()).select_from(Incident)) or 0
+        llm_count = session.scalar(
+            select(func.coalesce(func.sum(Incident.llm_calls), 0))
+        ) or 0
+
         return {
-            "logs_ingested": session.scalar(select(func.count()).select_from(LogEvent)) or 0,
-            "templates": session.scalar(select(func.count()).select_from(Template)) or 0,
-            "windows_scored": session.scalar(select(func.count()).select_from(WindowScore)) or 0,
-            "incidents": session.scalar(select(func.count()).select_from(Incident)) or 0,
-            "llm_calls": session.scalar(
-                select(func.coalesce(func.sum(Incident.llm_calls), 0))
-            )
-            or 0,
+            "total_log_lines": logs_count,
+            "total_windows": windows_count,
+            "incidents": incidents_count,
+            "llm_calls": llm_count,
+            # Backward-compatibility keys
+            "logs_ingested": logs_count,
+            "templates": templates_count,
+            "windows_scored": windows_count,
         }
 
 

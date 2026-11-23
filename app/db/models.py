@@ -70,13 +70,17 @@ class Incident(Base):
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    detected_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    analyzed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     status: Mapped[str] = mapped_column(Text, nullable=False, server_default="open")
+    category: Mapped[str | None] = mapped_column(Text, nullable=True)
     peak_score: Mapped[float] = mapped_column(Float, nullable=False)
     affected_services: Mapped[list[str]] = mapped_column(ARRAY(Text), nullable=False)
     top_templates: Mapped[dict[str, Any] | list[Any]] = mapped_column(
         JSONB, nullable=False, server_default=text("'{}'::jsonb")
     )
+    alternatives: Mapped[dict[str, Any] | list[Any] | None] = mapped_column(JSONB, nullable=True)
     root_cause: Mapped[str | None] = mapped_column(Text, nullable=True)
     confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
     remediation: Mapped[dict[str, Any] | list[Any] | None] = mapped_column(JSONB, nullable=True)

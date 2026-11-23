@@ -146,21 +146,28 @@ def test_save_window_score(db_session: Session) -> None:
 
 def test_incident_create_update_get_and_list(db_session: Session) -> None:
     started = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    detected = datetime(2026, 1, 1, 0, 0, 15, tzinfo=timezone.utc)
+    analyzed = datetime(2026, 1, 1, 0, 0, 30, tzinfo=timezone.utc)
     incident = repository.create_incident(
         db_session,
         started_at=started,
+        detected_at=detected,
         peak_score=0.9,
         affected_services=["payments"],
         top_templates={"4": 3},
     )
     assert incident.id is not None
     assert incident.status == "open"
+    assert incident.detected_at == detected
     assert incident.llm_calls == 0
 
     updated = repository.update_incident(
         db_session,
         incident.id,
         status="analyzed",
+        analyzed_at=analyzed,
+        category="database",
+        alternatives=[{"root_cause": "connection pool exhaustion", "confidence": 0.4}],
         root_cause="database timeout",
         confidence=0.8,
         remediation=[{"action": "inspect database"}],
@@ -168,7 +175,11 @@ def test_incident_create_update_get_and_list(db_session: Session) -> None:
         llm_calls=1,
     )
     assert updated is not None
-    assert repository.get_incident(db_session, incident.id).root_cause == "database timeout"
+    fetched = repository.get_incident(db_session, incident.id)
+    assert fetched.root_cause == "database timeout"
+    assert fetched.analyzed_at == analyzed
+    assert fetched.category == "database"
+    assert len(fetched.alternatives) == 1
     assert [item.id for item in repository.list_incidents(db_session, status="analyzed")] == [
         incident.id
     ]

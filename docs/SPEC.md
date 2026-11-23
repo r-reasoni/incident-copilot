@@ -145,11 +145,15 @@ One row per scored time window; indexed by `window_start`.
 |---|---|---|
 | `id` | `BIGSERIAL PK` | |
 | `started_at` | `TIMESTAMPTZ NOT NULL` | |
+| `detected_at` | `TIMESTAMPTZ` | Nullable detection / confirmation timestamp |
 | `ended_at` | `TIMESTAMPTZ` | Nullable until the incident ends |
+| `analyzed_at` | `TIMESTAMPTZ` | Nullable LLM analysis completion timestamp |
 | `status` | `TEXT NOT NULL` | `open`, `analyzed`, or `closed` |
+| `category` | `TEXT` | Nullable fault category |
 | `peak_score` | `FLOAT NOT NULL` | |
 | `affected_services` | `TEXT[] NOT NULL` | |
 | `top_templates` | `JSONB NOT NULL` | |
+| `alternatives` | `JSONB` | Nullable alternative root cause hypotheses |
 | `root_cause` | `TEXT` | Nullable LLM analysis |
 | `confidence` | `FLOAT` | Nullable LLM confidence |
 | `remediation` | `JSONB` | Nullable remediation list |
