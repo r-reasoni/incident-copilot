@@ -12,7 +12,7 @@ import sys
 
 from app.agent.agent import run_agent
 from app.db.repository import get_incident, list_incidents
-from app.db.session import get_session
+from app.db.session import SessionLocal
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("reanalyze")
@@ -21,7 +21,7 @@ logger = logging.getLogger("reanalyze")
 def reanalyze_incident(incident_id: int | str, force: bool = True) -> bool:
     """Re-run the agent on a single closed incident."""
     inc_id_int = int(incident_id)
-    with get_session() as session:
+    with SessionLocal() as session:
         incident = get_incident(session, inc_id_int)
         if incident is None:
             logger.error("Incident #%s not found", incident_id)
@@ -37,7 +37,7 @@ def reanalyze_incident(incident_id: int | str, force: bool = True) -> bool:
         logger.exception("Failed to re-run agent for incident #%s: %s", incident_id, exc)
         return False
 
-    with get_session() as session:
+    with SessionLocal() as session:
         updated = get_incident(session, inc_id_int)
         cat = updated.category if updated else None
         conf = updated.confidence if updated else None
@@ -55,7 +55,7 @@ def reanalyze_incident(incident_id: int | str, force: bool = True) -> bool:
 
 def reanalyze_all_closed(force: bool = True) -> int:
     """Re-run the agent on all closed incidents."""
-    with get_session() as session:
+    with SessionLocal() as session:
         closed = list_incidents(session, status="closed")
 
     # Sort ascending by ID

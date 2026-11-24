@@ -489,7 +489,7 @@ def test_reanalyze_cli(monkeypatch):
     def mock_run_agent(inc_id, force=False):
         executed_ids.append((inc_id, force))
 
-    monkeypatch.setattr("app.agent.reanalyze.get_session", lambda: MagicMock(__enter__=lambda s: mock_session, __exit__=lambda s, *a: None))
+    monkeypatch.setattr("app.agent.reanalyze.SessionLocal", lambda: MagicMock(__enter__=lambda s: mock_session, __exit__=lambda s, *a: None))
     monkeypatch.setattr("app.agent.reanalyze.run_agent", mock_run_agent)
     monkeypatch.setattr("app.agent.reanalyze.list_incidents", lambda session, status: [closed_inc])
 
