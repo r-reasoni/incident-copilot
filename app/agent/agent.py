@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 import json
 import logging
 import threading
+import time
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, ValidationError
@@ -105,14 +106,36 @@ def _broadcast_alert_safely(payload: dict[str, Any]) -> None:
         logger.debug("Failed to broadcast alert: %s", exc)
 
 
+_ACTIVE_AGENT_THREADS: list[threading.Thread] = []
+_ACTIVE_AGENT_THREADS_LOCK = threading.Lock()
+
+
+def wait_for_agents(timeout_seconds: float = 60.0) -> bool:
+    """Join all pending background agent threads until completion or timeout.
+
+    Returns True if all agent threads completed, False if timed out.
+    """
+    deadline = time.monotonic() + timeout_seconds
+    with _ACTIVE_AGENT_THREADS_LOCK:
+        threads = [t for t in _ACTIVE_AGENT_THREADS if t.is_alive()]
+    for t in threads:
+        remaining = max(0.1, deadline - time.monotonic())
+        if t.is_alive():
+            t.join(timeout=remaining)
+    with _ACTIVE_AGENT_THREADS_LOCK:
+        _ACTIVE_AGENT_THREADS[:] = [t for t in _ACTIVE_AGENT_THREADS if t.is_alive()]
+        return len(_ACTIVE_AGENT_THREADS) == 0
+
+
 def run_agent(
     incident_id: int,
     session: Session | None = None,
     custom_llm: Any | None = None,
+    force: bool = False,
 ) -> dict[str, Any]:
     """Execute the root-cause agent for a closed incident.
 
-    Runs ONLY for closed incidents. Never queries ground-truth fault data.
+    Runs ONLY for closed incidents (unless force=True). Never queries ground-truth fault data.
     Phase 1: Tool loop with Gemini function calling (automatic calling disabled) or MockLLM rules.
     Phase 2: Final JSON synthesis validated via Pydantic with single retry on invalid JSON.
     """
@@ -131,8 +154,8 @@ def run_agent(
         with SessionLocal() as s:
             incident = _get_inc(s)
 
-    # Strictly enforce that the agent ONLY runs for closed incidents
-    if incident.status != "closed":
+    # Strictly enforce that the agent ONLY runs for closed incidents unless explicitly forced (reanalyze)
+    if incident.status != "closed" and not force:
         raise ValueError(
             f"Agent runs ONLY for closed incidents; incident {incident_id} has status='{incident.status}'"
         )
@@ -160,6 +183,9 @@ def run_agent(
             }
 
             full_trace = {
+                "agent_status": "ok",
+                "reason": "Analysis completed successfully",
+                "model_used": getattr(provider, "last_model_used", "mock"),
                 "evidence_pack": evidence_pack,
                 "tool_calls": trace_tool_calls,
                 "final_json": validated.model_dump(),
@@ -410,7 +436,11 @@ def run_agent(
             "remediation": [step.model_dump() for step in validated_response.remediation],
         }
 
+        model_used = getattr(provider, "last_model_used", getattr(provider, "_model", "gemini"))
         full_trace = {
+            "agent_status": "ok",
+            "reason": "Analysis completed successfully",
+            "model_used": model_used,
             "evidence_pack": evidence_pack,
             "messages": trace_messages,
             "tool_calls": trace_tool_calls,
@@ -455,7 +485,11 @@ def run_agent(
     except Exception as exc:
         # Provider errors (429/5xx after retries) must leave incident as 'closed' with error note in agent_trace
         logger.exception("Provider error during agent execution for incident %s: %s", incident_id, exc)
+        model_used = getattr(provider, "last_model_used", getattr(provider, "_model", "unknown"))
         error_trace = {
+            "agent_status": "provider_error",
+            "reason": str(exc),
+            "model_used": model_used,
             "error": str(exc),
             "trace_messages": trace_messages,
             "tool_calls": trace_tool_calls,
@@ -490,6 +524,8 @@ def run_agent_background(incident_id: int) -> threading.Thread:
         name=f"agent-investigate-{incident_id}",
         daemon=True,
     )
+    with _ACTIVE_AGENT_THREADS_LOCK:
+        _ACTIVE_AGENT_THREADS.append(thread)
     thread.start()
     return thread
 

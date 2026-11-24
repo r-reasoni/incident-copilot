@@ -400,3 +400,104 @@ async def test_sampler_failure_handling():
         assert sample["probe_ok"] is False
         assert sample["probe_ms"] is None
         assert sample["cpu_percent"] == 0.0
+
+
+def test_gemini_client_503_retry_and_backoff(monkeypatch):
+    """GeminiClient retries 503 errors up to 6 times with exponential backoff and jitter."""
+    import time
+    from unittest.mock import MagicMock
+    from app.agent.llm import GeminiClient
+
+    client = GeminiClient(api_key="fake-key", model="gemini-2.5-flash")
+    mock_genai_client = MagicMock()
+    client._client = mock_genai_client
+
+    call_count = 0
+    mock_success_resp = MagicMock(text="success")
+
+    def mock_generate_content(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count < 3:
+            raise Exception("503 Service Unavailable: overloaded")
+        return mock_success_resp
+
+    mock_genai_client.models.generate_content.side_effect = mock_generate_content
+
+    slept_delays = []
+    monkeypatch.setattr(time, "sleep", lambda delay: slept_delays.append(delay))
+
+    resp = client.call_raw([{"role": "user", "parts": ["test prompt"]}])
+    assert resp == mock_success_resp
+    assert call_count == 3
+    assert len(slept_delays) == 2
+    assert slept_delays[0] >= 2.0  # initial backoff >= 2s
+    assert slept_delays[1] >= 4.0  # second backoff >= 4s
+    assert client.last_model_used == "gemini-2.5-flash"
+
+
+def test_gemini_client_fallback_model(monkeypatch):
+    """GeminiClient falls back to GEMINI_FALLBACK_MODELS when primary model exhausts retries."""
+    import time
+    from unittest.mock import MagicMock
+    from app.agent.llm import GeminiClient
+
+    monkeypatch.setattr("app.config.settings.gemini_fallback_models", "fallback-model-1")
+
+    client = GeminiClient(api_key="fake-key", model="primary-model")
+    mock_genai_client = MagicMock()
+    client._client = mock_genai_client
+
+    called_models = []
+    mock_success_resp = MagicMock(text="success from fallback")
+
+    def mock_generate_content(*args, **kwargs):
+        model = kwargs.get("model")
+        called_models.append(model)
+        if model == "primary-model":
+            raise Exception("503 Service Unavailable")
+        return mock_success_resp
+
+    mock_genai_client.models.generate_content.side_effect = mock_generate_content
+    monkeypatch.setattr(time, "sleep", lambda delay: None)
+
+    resp = client.call_raw([{"role": "user", "parts": ["test prompt"]}])
+    assert resp == mock_success_resp
+    assert called_models.count("primary-model") == 6
+    assert called_models[-1] == "fallback-model-1"
+    assert client.last_model_used == "fallback-model-1"
+
+
+def test_reanalyze_cli(monkeypatch):
+    """reanalyze CLI re-runs closed incidents with force=True."""
+    from app.agent.reanalyze import reanalyze_all_closed, reanalyze_incident
+
+    closed_inc = Incident(
+        id=201,
+        started_at=datetime.now(timezone.utc) - timedelta(minutes=5),
+        ended_at=datetime.now(timezone.utc),
+        status="closed",
+        peak_score=4.0,
+        affected_services=["api-service"],
+    )
+
+    mock_session = MagicMock()
+    mock_session.get.return_value = closed_inc
+
+    executed_ids = []
+
+    def mock_run_agent(inc_id, force=False):
+        executed_ids.append((inc_id, force))
+
+    monkeypatch.setattr("app.agent.reanalyze.get_session", lambda: MagicMock(__enter__=lambda s: mock_session, __exit__=lambda s, *a: None))
+    monkeypatch.setattr("app.agent.reanalyze.run_agent", mock_run_agent)
+    monkeypatch.setattr("app.agent.reanalyze.list_incidents", lambda session, status: [closed_inc])
+
+    ok = reanalyze_incident(201, force=True)
+    assert ok is True
+    assert executed_ids == [("201", True)]
+
+    executed_ids.clear()
+    count = reanalyze_all_closed(force=True)
+    assert count == 1
+    assert executed_ids == [("201", True)]

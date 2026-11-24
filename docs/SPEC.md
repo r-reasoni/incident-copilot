@@ -283,7 +283,16 @@ The harness measures:
 - **Precision** – what fraction of detected incidents are real
 - **Recall** – what fraction of real incidents are detected
 - **Mean Time To Detect (MTTD)** – lag from incident start to first anomalous window
-- **LLM Grade** – GPT-4 or Gemini judges the quality of root-cause narratives (0–10)
+- **LLM Grade** – root-cause accuracy evaluated against ground-truth fault types
+
+### 8.1 Live vs. Replay Evaluation Policy
+
+**Official Policy**: Official evaluation metrics and benchmark numbers come strictly from replaying a recorded dataset (`eval.replay`); live runs (`eval.run_step7`) are intended for real-time demonstration and end-to-end integration validation.
+
+**Why Live and Replay Differ**:
+- **Scheduling Jitter & Network Latency**: In live runs, testbed service logging, HTTP transport over sockets, OS thread scheduling, and background cron or garbage collection introduce variable delays (tens to hundreds of milliseconds). Log events occurring near window boundaries (e.g. at 09.98s vs 10.02s) may straddle different 10-second aggregation windows in live runs compared to their exact event timestamps.
+- **Deterministic Event-Time Evaluation**: Replay processes events strictly according to their recorded `event["ts"]` timestamps, advancing the pipeline clock deterministically. Two runs of `eval.replay` over the exact same log file produce 100% identical window scores, thresholds, flags, and incident groupings.
+- **The `memory_leak` Divergence (Case Study)**: In the Step 5 benchmark run, `memory_leak` produced 0 anomalous flags during the live run, but 1 anomalous flag during offline replay. In the live run, logging transport jitter split the cluster of memory-leak warning logs across two consecutive wall-clock windows (diluting the log rate and feature mass below the anomaly threshold). In replay, event-time alignment placed the burst into its true 10-second event interval, elevating the feature vector and crossing the threshold. Because ground truth is based on the system's actual events, deterministic event-time replay represents the true evaluation standard.
 
 ---
 
@@ -296,7 +305,8 @@ All settings are read from environment variables or `.env`. Below is the complet
 | `DATABASE_URL` | `str` | `postgresql+psycopg://postgres:postgres@localhost:5432/incident_copilot` | PostgreSQL connection string |
 | `LLM_PROVIDER` | `str` | `gemini` | LLM backend provider (`gemini` or `mock`) |
 | `GEMINI_API_KEY` | `str` | `your_key_here` | API key for Gemini; evaluated only upon making LLM calls |
-| `GEMINI_MODEL` | `str` | `gemini-3.8-flash` | Gemini model identifier forwarded to the SDK |
+| `GEMINI_MODEL` | `str` | `gemini-3.8-flash` | Gemini primary model identifier |
+| `GEMINI_FALLBACK_MODELS` | `str` | `""` | Comma-separated list of fallback models when primary fails |
 | `WINDOW_SECONDS` | `int` | `10` | Duration of each aggregation time window in seconds |
 | `WARMUP_WINDOWS` | `int` | `30` | Initial baseline windows observed before scoring is trusted |
 | `ANOMALY_GAP_SECONDS` | `int` | `30` | Maximum interval to merge adjacent anomalous windows into one incident |
@@ -315,6 +325,8 @@ All settings are read from environment variables or `.env`. Below is the complet
 | `DRAIN_STATE_PATH` | `str` | `data/drain_state.bin` | File path for persisting Drain3 parse tree state |
 | `METRICS_SAMPLE_SECONDS` | `int` | `5` | Interval in seconds between background host metric samples |
 | `RECORD_EVENTS_PATH` | `str` | `""` | Optional file path to stream all ingested raw events as JSON lines |
+| `RECORD_METRICS_PATH` | `str` | `""` | Optional file path to stream all metrics samples as JSON lines |
+| `RECORD_WINDOWS_PATH` | `str` | `""` | Optional file path to stream all scored window results as JSON lines |
 
 ### 9.1 Effective HST Window Size & Suspect Quarantine
 

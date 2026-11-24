@@ -33,9 +33,11 @@ from eval.replay import print_incident_table
 from testbed.fault_injector import run_fault
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
-RUN_DIR = ROOT_DIR / "eval" / "runs" / "step7"
+RUN_NAME = os.getenv("STEP7_RUN_NAME", "step7b")
+RUN_DIR = ROOT_DIR / "eval" / "runs" / RUN_NAME
 EVENTS_PATH = RUN_DIR / "events.jsonl"
 METRICS_PATH = RUN_DIR / "metrics.jsonl"
+WINDOWS_PATH = RUN_DIR / "windows.jsonl"
 FAULTS_PATH = RUN_DIR / "faults.json"
 DRAIN_STATE_PATH = ROOT_DIR / "data" / "drain_state.bin"
 
@@ -56,7 +58,7 @@ def clean_state() -> None:
         print(f"Removed {DRAIN_STATE_PATH}.")
 
     RUN_DIR.mkdir(parents=True, exist_ok=True)
-    for p in (EVENTS_PATH, METRICS_PATH, FAULTS_PATH):
+    for p in (EVENTS_PATH, METRICS_PATH, WINDOWS_PATH, FAULTS_PATH):
         if p.exists():
             p.unlink()
             print(f"Removed old {p}.")
@@ -81,6 +83,7 @@ def main() -> None:
     env_api = os.environ.copy()
     env_api["RECORD_EVENTS_PATH"] = str(EVENTS_PATH)
     env_api["RECORD_METRICS_PATH"] = str(METRICS_PATH)
+    env_api["RECORD_WINDOWS_PATH"] = str(WINDOWS_PATH)
     env_api["LLM_PROVIDER"] = "gemini"
 
     print("\n--- 2. Starting Ingestion API and Testbed services ---")
@@ -148,8 +151,21 @@ def main() -> None:
                 time.sleep(60)
                 print(f"  Recovery elapsed {(s + 1) * 60}s / 120s...")
 
-        print("\nAll 5 faults completed.")
-        time.sleep(10)
+        print("\nAll 5 faults and 120s recovery completed.")
+
+        # Stop loadgen so recording stops precisely after recovery
+        print("Stopping loadgen after last recovery...")
+        if proc_loadgen and proc_loadgen.poll() is None:
+            proc_loadgen.terminate()
+            try:
+                proc_loadgen.wait(timeout=5)
+            except Exception:
+                pass
+            proc_loadgen = None
+
+        # Wait remaining 30s to hit exactly last fault end + 150 seconds
+        print("Waiting remaining 30s to complete 150s post-fault observation window...")
+        time.sleep(30)
 
         # Flush pipeline and wait for background agents
         print("\n--- 6. Flushing pipeline and waiting for agent analysis ---")
@@ -159,9 +175,13 @@ def main() -> None:
         except Exception as e:
             print(f"Flush call error: {e}")
 
-        # Wait up to 30s for any remaining background agent tasks to complete
-        print("Waiting for any pending agent analyses to finish...")
-        time.sleep(20)
+        # Wait for all background agents to complete before taking down the API
+        print("Waiting for all pending agent analyses to finish (via /agents/wait)...")
+        try:
+            r = httpx.post("http://127.0.0.1:8000/agents/wait?timeout=60", timeout=70.0)
+            print(f"Agents wait response: {r.status_code} {r.json()}")
+        except Exception as e:
+            print(f"Agents wait call error: {e}")
 
     finally:
         print("\n--- 7. Stopping background processes ---")

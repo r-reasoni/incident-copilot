@@ -130,6 +130,8 @@ def replay(
     if dropped_events > 0:
         print(f"Truncated after faults: dropped {dropped_events} trailing events after {cutoff_ts.isoformat()}.")
         print("Note: Trailing silence after an experiment is not part of the evaluation.")
+    elif cutoff_ts is not None:
+        print(f"Truncated after faults: dropped 0 trailing events (cutoff was {cutoff_ts.isoformat()}).")
 
     print(f"Replayed {total_events} events. Flushing pipeline...")
     pipeline.flush()
@@ -137,7 +139,7 @@ def replay(
     incidents = incident_manager.list_incidents()
     print(f"\nReplay complete. Found {len(incidents)} incidents.")
 
-    from app.agent.agent import run_agent
+    from app.agent.agent import run_agent, wait_for_agents
     from app.db import repository
     print(f"Executing root-cause agent on {len(incidents)} incidents sequentially...")
     for inc in incidents:
@@ -145,6 +147,8 @@ def replay(
             run_agent(inc.id)
         except Exception as exc:
             print(f"Agent analysis failed for incident {inc.id}: {exc}")
+
+    wait_for_agents(timeout_seconds=60.0)
 
     with SessionLocal() as session:
         db_incidents = repository.list_incidents(session)
@@ -213,7 +217,8 @@ def print_incident_table(incidents: list[Any], faults: list[dict[str, Any]]) -> 
 
         trace = getattr(inc, "agent_trace", {}) or {}
         tool_calls = [tc.get("tool", tc.get("name")) for tc in trace.get("tool_calls", [])]
-        print(f"  Agent Diag  : Category:   {inc.category}")
+        cat_display = inc.category if inc.category is not None else "NOT ANALYZED"
+        print(f"  Agent Diag  : Category:   {cat_display}")
         print(f"                Confidence: {inc.confidence}")
         print(f"                LLM Calls:  {inc.llm_calls}")
         print(f"                Tools Used: {', '.join(tool_calls) if tool_calls else 'None'}")
@@ -230,8 +235,11 @@ def print_incident_table(incidents: list[Any], faults: list[dict[str, Any]]) -> 
         }
         if matching_fault:
             exp_cat = fault_to_cat.get(matching_fault["fault_type"])
-            matches = (inc.category == exp_cat)
-            print(f"  Matching Flt: {matching_fault['fault_type']} (expected: {exp_cat}) | Category Match: {matches}")
+            if inc.category is None:
+                print(f"  Matching Flt: {matching_fault['fault_type']} (expected: {exp_cat}) | Category Match: NOT ANALYZED")
+            else:
+                matches = (inc.category == exp_cat)
+                print(f"  Matching Flt: {matching_fault['fault_type']} (expected: {exp_cat}) | Category Match: {matches}")
         else:
             print("  Matching Flt: NONE (Unmatched incident)")
 
@@ -244,8 +252,11 @@ def print_incident_table(incidents: list[Any], faults: list[dict[str, Any]]) -> 
 
     print("\n" + "-" * 120)
     print(f"Summary: {len(incidents)} incidents created versus {len(parsed_faults)} injected faults.")
-    if len(matched_fault_ids) == len(parsed_faults) and not unmatched_incidents:
-        print("Result: PERFECT MATCH - All faults detected with 0 false positive incidents!")
+    has_unanalyzed = any(inc.category is None for inc in incidents)
+    if len(matched_fault_ids) == len(parsed_faults) and not unmatched_incidents and not has_unanalyzed:
+        print("Result: PERFECT MATCH - All faults detected and diagnosed with 0 false positive incidents!")
+    elif len(matched_fault_ids) == len(parsed_faults) and not unmatched_incidents:
+        print("Result: ALL FAULTS DETECTED (Some incidents NOT ANALYZED)")
     else:
         unmatched_faults = [pf["fault_type"] for pf in parsed_faults if pf["id"] not in matched_fault_ids]
         if unmatched_faults:
@@ -260,6 +271,7 @@ def main() -> None:
     parser.add_argument("events", type=Path, help="Path to events.jsonl")
     parser.add_argument("--faults", type=Path, default=None, help="Optional path to faults.json")
     parser.add_argument("--metrics", type=Path, default=None, help="Optional path to metrics.jsonl")
+    parser.add_argument("--windows", type=Path, default=None, help="Optional path to record windows JSON lines")
     parser.add_argument("--yes", action="store_true", help="Confirm table truncation")
     parser.add_argument("--batch-size", type=int, default=100, help="Batch size for ingestion")
     parser.add_argument(
@@ -277,6 +289,11 @@ def main() -> None:
     if not args.events.exists():
         print(f"ERROR: Events file not found at {args.events}", file=sys.stderr)
         sys.exit(1)
+
+    if args.windows:
+        if args.windows.exists():
+            args.windows.unlink()
+        settings.record_windows_path = str(args.windows)
 
     replay(
         args.events,

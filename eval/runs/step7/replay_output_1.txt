@@ -1,0 +1,83 @@
+Removed Drain state at data/drain_state.bin
+Loaded 544 metrics samples from eval/runs/step7/metrics.jsonl.
+Faults loaded (5). Evaluation cutoff at 2026-11-23T19:19:32.945150+00:00 (+150s).
+Replaying events from eval/runs/step7/events.jsonl (batch_size=100)...
+Truncated after faults: dropped 0 trailing events (cutoff was 2026-11-23T19:19:32.945150+00:00).
+Replayed 19791 events. Flushing pipeline...
+
+Replay complete. Found 4 incidents.
+Executing root-cause agent on 4 incidents sequentially...
+
+========================================================================================================================
+                                                 INCIDENT SUMMARY TABLE                                                 
+========================================================================================================================
+
+[Incident #4] Status: analyzed | Peak Score: 0.9997
+  Time Window : Started:  2026-11-24T00:37:00+05:30
+                Detected: 2026-11-24T00:37:20+05:30
+                Ended:    2026-11-24T00:47:10+05:30
+  Affected Svc: ['api-service']
+  Agent Diag  : Category:   unknown
+                Confidence: 0.0
+                LLM Calls:  1
+                Tools Used: get_host_metrics, get_network_stats
+                Root Cause: Insufficient evidence to distinguish between fault categories
+  Matching Flt: latency (expected: network_latency) | Category Match: False
+  Top Templates (up to 3):
+    1. [ratio=6.8x, is_new=False] Slow request POST /orders completed in <DUR>
+    2. [ratio=3.6x, is_new=False] Slow request GET /users/<NUM> completed in <DUR>
+    3. [ratio=0.02x, is_new=False] Job <NUM> completed for user <NUM>
+
+[Incident #3] Status: analyzed | Peak Score: 0.9729
+  Time Window : Started:  2026-11-24T00:33:50+05:30
+                Detected: 2026-11-24T00:34:10+05:30
+                Ended:    2026-11-24T00:35:00+05:30
+  Affected Svc: ['api-service', 'worker-service']
+  Agent Diag  : Category:   packet_loss
+                Confidence: 0.85
+                LLM Calls:  1
+                Tools Used: get_host_metrics, get_network_stats
+                Root Cause: Network packet loss causing dropped connections and request timeouts
+  Matching Flt: packet_loss (expected: packet_loss) | Category Match: True
+  Top Templates (up to 3):
+    1. [ratio=65.15x, is_new=True] Request timed out waiting for an upstream response
+    2. [ratio=34.29x, is_new=False] Upstream request timed out; retrying job
+    3. [ratio=8.57x, is_new=False] Job <NUM> failed after retry
+
+[Incident #2] Status: analyzed | Peak Score: 0.9944
+  Time Window : Started:  2026-11-24T00:30:50+05:30
+                Detected: 2026-11-24T00:31:10+05:30
+                Ended:    2026-11-24T00:32:00+05:30
+  Affected Svc: ['api-service', 'worker-service']
+  Agent Diag  : Category:   cpu
+                Confidence: 0.9
+                LLM Calls:  1
+                Tools Used: get_host_metrics, get_network_stats
+                Root Cause: CPU starvation caused by computation-heavy workload or busy spin loop
+  Matching Flt: cpu_hog (expected: cpu) | Category Match: True
+  Top Templates (up to 3):
+    1. [ratio=72.0x, is_new=False] Slow request POST /orders completed in <DUR>
+    2. [ratio=66.86x, is_new=False] Slow request GET /users/<NUM> completed in <DUR>
+    3. [ratio=1.71x, is_new=False] Upstream request timed out; retrying job
+
+[Incident #1] Status: analyzed | Peak Score: 0.9998
+  Time Window : Started:  2026-11-24T00:27:50+05:30
+                Detected: 2026-11-24T00:28:10+05:30
+                Ended:    2026-11-24T00:29:00+05:30
+  Affected Svc: ['api-service', 'worker-service']
+  Agent Diag  : Category:   network_latency
+                Confidence: 0.85
+                LLM Calls:  1
+                Tools Used: get_host_metrics, get_network_stats
+                Root Cause: Elevated network latency causing high end-to-end request duration
+  Matching Flt: db_lock (expected: db_lock) | Category Match: False
+  Top Templates (up to 3):
+    1. [ratio=44.57x, is_new=False] Upstream request timed out; retrying job
+    2. [ratio=36.0x, is_new=True] Slow request POST /orders completed in <DUR>
+    3. [ratio=36.0x, is_new=True] Order persistence resumed after delay of <DUR>
+
+------------------------------------------------------------------------------------------------------------------------
+Summary: 4 incidents created versus 5 injected faults.
+Missed Faults: ['memory_leak']
+========================================================================================================================
+

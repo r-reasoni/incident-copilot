@@ -5,12 +5,15 @@ Processing pipeline linking Drain3 parsed logs, window aggregation, and online a
 """
 from __future__ import annotations
 
+import json
 import logging
 from collections import Counter
 from datetime import datetime
+from pathlib import Path
 from threading import Lock
 from typing import TYPE_CHECKING, Any, Callable
 
+from app.config import settings
 from app.detection.detector import AnomalyDetector, WindowResult
 from app.detection.windowing import WindowAggregator
 
@@ -49,6 +52,32 @@ class Pipeline:
         self._flushed: bool = False
         self._errors: int = 0
 
+    def _dispatch_window_result(self, result: WindowResult) -> None:
+        record_path = getattr(settings, "record_windows_path", "")
+        if record_path:
+            try:
+                p = Path(record_path)
+                p.parent.mkdir(parents=True, exist_ok=True)
+                with open(p, "a", encoding="utf-8") as f:
+                    entry = {
+                        "window_start": result.window_start.isoformat(),
+                        "score": result.score,
+                        "threshold": result.threshold,
+                        "is_anomalous": result.is_anomalous,
+                        "confirmed_at": result.confirmed_at.isoformat() if result.confirmed_at else None,
+                    }
+                    f.write(json.dumps(entry) + "\n")
+            except Exception:
+                self._errors += 1
+                logger.exception("Failed to write window result to record_windows_path")
+
+        for callback in self.on_window:
+            try:
+                callback(result)
+            except Exception:
+                self._errors += 1
+                logger.exception("Error executing on_window callback")
+
     def process(self, event: dict[str, Any], parsed: ParsedLog | None = None) -> None:
         """Process an ingested log event through aggregation, scoring, and incident tracking."""
         with self._lock:
@@ -73,12 +102,7 @@ class Pipeline:
                     self._errors += 1
                     logger.exception("Error scoring window in detector")
                     continue
-                for callback in self.on_window:
-                    try:
-                        callback(result)
-                    except Exception:
-                        self._errors += 1
-                        logger.exception("Error executing on_window callback")
+                self._dispatch_window_result(result)
 
     def tick(self, now: datetime) -> None:
         """Wall-clock or event-time heartbeat to close windows and incidents."""
@@ -99,12 +123,7 @@ class Pipeline:
                     self._errors += 1
                     logger.exception("Error scoring window during tick")
                     continue
-                for callback in self.on_window:
-                    try:
-                        callback(result)
-                    except Exception:
-                        self._errors += 1
-                        logger.exception("Error executing on_window callback during tick")
+                self._dispatch_window_result(result)
             if self.incident_manager is not None:
                 try:
                     self.incident_manager.tick(now)
@@ -130,12 +149,7 @@ class Pipeline:
                     self._errors += 1
                     logger.exception("Error scoring window during flush")
                     continue
-                for callback in self.on_window:
-                    try:
-                        callback(result)
-                    except Exception:
-                        self._errors += 1
-                        logger.exception("Error executing on_window callback during flush")
+                self._dispatch_window_result(result)
             if self.incident_manager is not None:
                 try:
                     self.incident_manager.flush()

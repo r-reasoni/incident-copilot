@@ -472,6 +472,11 @@ class IncidentManager:
     def _close_incident_locked(self, incident: IncidentRecord) -> None:
         incident.ended_at = incident.last_anomalous_end
         incident.status = "closed"
+        if incident.agent_trace is None:
+            incident.agent_trace = {
+                "agent_status": "not_run",
+                "reason": "Incident closed, waiting for agent dispatch",
+            }
         self._compute_metrics(incident)
 
         self._persist_update_locked(incident)
@@ -504,6 +509,7 @@ class IncidentManager:
                     peak_score=incident.peak_score,
                     affected_services=incident.affected_services,
                     top_templates=self._pack_top_templates_payload(incident),
+                    agent_trace=incident.agent_trace,
                 )
         except Exception:
             logger.exception("Failed to update incident %s in database", incident.id)

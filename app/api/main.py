@@ -167,6 +167,22 @@ async def health() -> dict[str, str]:
     return {"status": "ok", "llm_provider": settings.llm_provider}
 
 
+@app.post("/flush", tags=["pipeline"])
+def flush_pipeline(request: Request) -> dict[str, str]:
+    pipeline = getattr(request.app.state, "pipeline", None)
+    if pipeline is not None:
+        pipeline.flush()
+    return {"status": "flushed"}
+
+
+@app.post("/agents/wait", tags=["agents"])
+def wait_agents(timeout: float = 60.0) -> dict[str, Any]:
+    from app.agent.agent import wait_for_agents
+
+    all_done = wait_for_agents(timeout_seconds=timeout)
+    return {"all_done": all_done}
+
+
 @app.post("/ingest/logs", status_code=202, tags=["ingestion"])
 async def ingest_logs(events: list[LogEventInput], request: Request) -> dict[str, int]:
     queue: asyncio.Queue[LogEventInput] = request.app.state.ingest_queue

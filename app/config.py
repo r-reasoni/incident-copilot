@@ -25,6 +25,7 @@ class Settings:
         self.llm_provider = os.getenv("LLM_PROVIDER", "gemini")
         self.gemini_api_key = os.getenv("GEMINI_API_KEY", "your_key_here")
         self.gemini_model = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+        self.gemini_fallback_models = os.getenv("GEMINI_FALLBACK_MODELS", "")
         self.database_url = os.getenv(
             "DATABASE_URL",
             "postgresql+psycopg://postgres:postgres@localhost:5432/incident_copilot",
@@ -52,6 +53,7 @@ class Settings:
         self.drain_state_path = os.getenv("DRAIN_STATE_PATH", "data/drain_state.bin")
         self.metrics_sample_seconds = int(os.getenv("METRICS_SAMPLE_SECONDS", "5"))
         self.record_events_path = os.getenv("RECORD_EVENTS_PATH", "")
+        self.record_windows_path = os.getenv("RECORD_WINDOWS_PATH", "")
         self.services = [
             s.strip()
             for s in os.getenv("SERVICES", "api-service,worker-service").split(",")

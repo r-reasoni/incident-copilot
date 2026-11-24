@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 import time
 from typing import Any
 
@@ -19,11 +20,12 @@ class LLMConfigurationError(RuntimeError):
 class GeminiClient:
     """Gemini client using the google-genai SDK, loaded only when called."""
 
-    def __init__(self, api_key: str, model: str, retries: int = 3) -> None:
+    def __init__(self, api_key: str, model: str, retries: int = 6) -> None:
         self._api_key = api_key
         self._model = model
         self._retries = retries
         self._client: Any | None = None
+        self.last_model_used: str = model
 
     def _get_client(self) -> Any:
         if not self._api_key or self._api_key == "your_key_here":
@@ -61,30 +63,45 @@ class GeminiClient:
         if tools is not None:
             config["tools"] = tools
 
-        for attempt in range(self._retries + 1):
-            try:
-                response = client.models.generate_content(
-                    model=self._model,
-                    contents=contents,
-                    config=types.GenerateContentConfig(**config),
-                )
-                return response.text or ""
-            except Exception as exc:
-                if self._status_code(exc) == 404:
-                    raise RuntimeError(
-                        f"Model {self._model} is not available for this key. Run "
-                        "python scripts/list_models.py and update GEMINI_MODEL in .env."
-                    ) from exc
-                if self._status_code(exc) in (429, 503):
-                    fallback_models = ["gemini-3-flash-preview", "gemini-3.1-flash-lite", "gemini-flash-latest"]
-                    for fb in fallback_models:
-                        if self._model != fb:
-                            logger.warning("Model %s returned %s; falling back to %s", self._model, self._status_code(exc), fb)
-                            self._model = fb
+        settings = get_settings()
+        fb_raw = getattr(settings, "gemini_fallback_models", "")
+        fallback_candidates = [m.strip() for m in fb_raw.split(",") if m.strip()]
+        models_to_try = [self._model] + [m for m in fallback_candidates if m != self._model]
+
+        for model_idx, model_name in enumerate(models_to_try):
+            for attempt in range(self._retries):
+                try:
+                    response = client.models.generate_content(
+                        model=model_name,
+                        contents=contents,
+                        config=types.GenerateContentConfig(**config),
+                    )
+                    self.last_model_used = model_name
+                    return response.text or ""
+                except Exception as exc:
+                    status = self._status_code(exc)
+                    if status == 404:
+                        raise RuntimeError(
+                            f"Model {model_name} is not available for this key. Run "
+                            "python scripts/list_models.py and update GEMINI_MODEL in .env."
+                        ) from exc
+                    if not self._is_retryable(exc):
+                        raise
+                    if attempt >= self._retries - 1:
+                        if model_idx + 1 < len(models_to_try):
+                            next_model = models_to_try[model_idx + 1]
+                            logger.warning(
+                                "Model %s exhausted %d attempts (%s); falling back to %s",
+                                model_name, self._retries, exc, next_model,
+                            )
                             break
-                if attempt >= self._retries or not self._is_retryable(exc):
-                    raise
-                time.sleep(2**attempt)
+                        raise
+                    delay = min(60.0, 2.0 * (2 ** attempt)) + random.uniform(0.1, 1.0)
+                    logger.warning(
+                        "Transient error (%s) calling %s (attempt %d/%d). Retrying in %.2fs...",
+                        exc, model_name, attempt + 1, self._retries, delay,
+                    )
+                    time.sleep(delay)
         raise RuntimeError("Gemini generation failed without a response")
 
     def call_raw(
@@ -116,30 +133,45 @@ class GeminiClient:
 
         config = types.GenerateContentConfig(**config_dict)
 
-        for attempt in range(self._retries + 1):
-            try:
-                response = client.models.generate_content(
-                    model=self._model,
-                    contents=contents,
-                    config=config,
-                )
-                return response
-            except Exception as exc:
-                if self._status_code(exc) == 404:
-                    raise RuntimeError(
-                        f"Model {self._model} is not available for this key. Run "
-                        "python scripts/list_models.py and update GEMINI_MODEL in .env."
-                    ) from exc
-                if self._status_code(exc) in (429, 503):
-                    fallback_models = ["gemini-3-flash-preview", "gemini-3.1-flash-lite", "gemini-flash-latest"]
-                    for fb in fallback_models:
-                        if self._model != fb:
-                            logger.warning("Model %s returned %s; falling back to %s", self._model, self._status_code(exc), fb)
-                            self._model = fb
+        settings = get_settings()
+        fb_raw = getattr(settings, "gemini_fallback_models", "")
+        fallback_candidates = [m.strip() for m in fb_raw.split(",") if m.strip()]
+        models_to_try = [self._model] + [m for m in fallback_candidates if m != self._model]
+
+        for model_idx, model_name in enumerate(models_to_try):
+            for attempt in range(self._retries):
+                try:
+                    response = client.models.generate_content(
+                        model=model_name,
+                        contents=contents,
+                        config=config,
+                    )
+                    self.last_model_used = model_name
+                    return response
+                except Exception as exc:
+                    status = self._status_code(exc)
+                    if status == 404:
+                        raise RuntimeError(
+                            f"Model {model_name} is not available for this key. Run "
+                            "python scripts/list_models.py and update GEMINI_MODEL in .env."
+                        ) from exc
+                    if not self._is_retryable(exc):
+                        raise
+                    if attempt >= self._retries - 1:
+                        if model_idx + 1 < len(models_to_try):
+                            next_model = models_to_try[model_idx + 1]
+                            logger.warning(
+                                "Model %s exhausted %d attempts (%s); falling back to %s",
+                                model_name, self._retries, exc, next_model,
+                            )
                             break
-                if attempt >= self._retries or not self._is_retryable(exc):
-                    raise
-                time.sleep(2**attempt)
+                        raise
+                    delay = min(60.0, 2.0 * (2 ** attempt)) + random.uniform(0.1, 1.0)
+                    logger.warning(
+                        "Transient error (%s) calling %s (attempt %d/%d). Retrying in %.2fs...",
+                        exc, model_name, attempt + 1, self._retries, delay,
+                    )
+                    time.sleep(delay)
         raise RuntimeError("Gemini API call failed without a response")
 
     @staticmethod
@@ -155,9 +187,10 @@ class GeminiClient:
     @staticmethod
     def _is_retryable(error: Exception) -> bool:
         status_code = GeminiClient._status_code(error)
-        if status_code is None:
-            return False
-        return status_code == 429 or 500 <= status_code <= 599
+        if status_code is not None:
+            return status_code == 429 or 500 <= status_code <= 599
+        err_msg = str(error).lower()
+        return "503" in err_msg or "429" in err_msg or "unavailable" in err_msg or "resource_exhausted" in err_msg
 
 
 class MockLLM:
@@ -171,6 +204,9 @@ class MockLLM:
     - uniformly high latency with normal cpu and few errors -> network_latency
     - otherwise -> unknown
     """
+
+    def __init__(self) -> None:
+        self.last_model_used = "mock"
 
     def generate(
         self,
