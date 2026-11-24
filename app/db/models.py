@@ -6,6 +6,7 @@ from typing import Any
 
 from sqlalchemy import (
     BigInteger,
+    Boolean,
     CheckConstraint,
     Float,
     Index,
@@ -99,3 +100,24 @@ class FaultEvent(Base):
     target_service: Mapped[str] = mapped_column(Text, nullable=False)
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+class MetricsSample(Base):
+    __tablename__ = "metrics_samples"
+    __table_args__ = (
+        Index("ix_metrics_samples_service_ts", "service", "ts"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    service: Mapped[str] = mapped_column(Text, nullable=False)
+    cpu_percent: Mapped[float] = mapped_column(Float, nullable=False)
+    mem_percent: Mapped[float] = mapped_column(Float, nullable=False)
+    open_handles: Mapped[int] = mapped_column(Integer, nullable=False)
+    threads: Mapped[int] = mapped_column(Integer, nullable=False)
+    p50_ms: Mapped[float] = mapped_column(Float, nullable=False)
+    p95_ms: Mapped[float] = mapped_column(Float, nullable=False)
+    error_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    in_flight_requests: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    request_count_30s: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    probe_ms: Mapped[float | None] = mapped_column(Float, nullable=True)
+    probe_ok: Mapped[bool] = mapped_column(Boolean, nullable=False)

@@ -14,6 +14,8 @@ from pydantic import BaseModel, ConfigDict, field_validator
 from sqlalchemy import func, select
 
 from app.config import settings
+from app.agent.agent import incident_agent_hook
+from app.agent.metrics_sampler import run_metrics_sampler
 from app.db.models import Incident, LogEvent, Template, WindowScore
 from app.db.repository import insert_logs, list_incidents, upsert_templates
 from app.db.session import SessionLocal
@@ -122,14 +124,21 @@ async def lifespan(application: FastAPI):
   application.state.ingest_queue = asyncio.Queue(maxsize=QUEUE_MAXSIZE)
   parser = LogParser()
   application.state.parser = parser
-  incident_manager = IncidentManager(broadcast_callback=broadcast_alert)
+  incident_manager = IncidentManager(
+      broadcast_callback=broadcast_alert,
+      agent_hook=incident_agent_hook,
+  )
   application.state.incident_manager = incident_manager
   application.state.pipeline = Pipeline(parser=parser, incident_manager=incident_manager)
   consumer = asyncio.create_task(_ingest_consumer(application))
   ticker = asyncio.create_task(_tick_worker(application))
+  sampler = asyncio.create_task(run_metrics_sampler())
   try:
     yield
   finally:
+    sampler.cancel()
+    with suppress(asyncio.CancelledError):
+      await sampler
     ticker.cancel()
     with suppress(asyncio.CancelledError):
       await ticker
@@ -263,8 +272,13 @@ def get_incident(incident_id: int, request: Request) -> dict[str, Any]:
 @app.get("/stats", tags=["meta"])
 def stats(request: Request) -> dict[str, int]:
     manager: IncidentManager | None = getattr(request.app.state, "incident_manager", None)
+    pipeline: Pipeline | None = getattr(request.app.state, "pipeline", None)
+    pipeline_errors = pipeline.errors if pipeline is not None else 0
+
     if manager is not None and not manager.persist:
-        return manager.stats
+        res = dict(manager.stats)
+        res["errors"] = pipeline_errors
+        return res
 
     with SessionLocal() as session:
         logs_count = session.scalar(select(func.count()).select_from(LogEvent)) or 0
@@ -280,6 +294,7 @@ def stats(request: Request) -> dict[str, int]:
             "total_windows": windows_count,
             "incidents": incidents_count,
             "llm_calls": llm_count,
+            "errors": pipeline_errors,
             # Backward-compatibility keys
             "logs_ingested": logs_count,
             "templates": templates_count,

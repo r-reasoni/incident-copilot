@@ -5,6 +5,7 @@ Processing pipeline linking Drain3 parsed logs, window aggregation, and online a
 """
 from __future__ import annotations
 
+import logging
 from collections import Counter
 from datetime import datetime
 from threading import Lock
@@ -16,6 +17,8 @@ from app.detection.windowing import WindowAggregator
 if TYPE_CHECKING:
     from app.incidents.manager import IncidentManager
     from app.parsing.parser import LogParser, ParsedLog
+
+logger = logging.getLogger(__name__)
 
 
 class Pipeline:
@@ -44,54 +47,112 @@ class Pipeline:
         self._last_tick: datetime | None = None
         self._tick_count: int = 0
         self._flushed: bool = False
+        self._errors: int = 0
 
     def process(self, event: dict[str, Any], parsed: ParsedLog | None = None) -> None:
         """Process an ingested log event through aggregation, scoring, and incident tracking."""
         with self._lock:
             self._counts[event.get("service", "unknown")] += 1
             if self.incident_manager is not None:
-                self.incident_manager.record_log(event, parsed)
-            closed_windows = self.aggregator.add(event, parsed)
+                try:
+                    self.incident_manager.record_log(event, parsed)
+                except Exception:
+                    self._errors += 1
+                    logger.exception("Error recording log in incident manager")
+            try:
+                closed_windows = self.aggregator.add(event, parsed)
+            except Exception:
+                self._errors += 1
+                logger.exception("Error adding event to aggregator")
+                closed_windows = []
+
             for window in closed_windows:
-                result = self.detector.score_window(window)
+                try:
+                    result = self.detector.score_window(window)
+                except Exception:
+                    self._errors += 1
+                    logger.exception("Error scoring window in detector")
+                    continue
                 for callback in self.on_window:
                     try:
                         callback(result)
                     except Exception:
-                        pass
+                        self._errors += 1
+                        logger.exception("Error executing on_window callback")
 
     def tick(self, now: datetime) -> None:
         """Wall-clock or event-time heartbeat to close windows and incidents."""
         with self._lock:
             self._last_tick = now
             self._tick_count += 1
-            closed_windows = self.aggregator.tick(now)
+            try:
+                closed_windows = self.aggregator.tick(now)
+            except Exception:
+                self._errors += 1
+                logger.exception("Error ticking aggregator")
+                closed_windows = []
+
             for window in closed_windows:
-                result = self.detector.score_window(window)
+                try:
+                    result = self.detector.score_window(window)
+                except Exception:
+                    self._errors += 1
+                    logger.exception("Error scoring window during tick")
+                    continue
                 for callback in self.on_window:
                     try:
                         callback(result)
                     except Exception:
-                        pass
+                        self._errors += 1
+                        logger.exception("Error executing on_window callback during tick")
             if self.incident_manager is not None:
-                self.incident_manager.tick(now)
+                try:
+                    self.incident_manager.tick(now)
+                except Exception:
+                    self._errors += 1
+                    logger.exception("Error ticking incident manager")
 
     def flush(self) -> None:
         """Close everything (end of replay / shutdown)."""
         with self._lock:
             self._flushed = True
-            closed_windows = self.aggregator.flush()
+            try:
+                closed_windows = self.aggregator.flush()
+            except Exception:
+                self._errors += 1
+                logger.exception("Error flushing aggregator")
+                closed_windows = []
+
             for window in closed_windows:
-                result = self.detector.score_window(window)
+                try:
+                    result = self.detector.score_window(window)
+                except Exception:
+                    self._errors += 1
+                    logger.exception("Error scoring window during flush")
+                    continue
                 for callback in self.on_window:
                     try:
                         callback(result)
                     except Exception:
-                        pass
+                        self._errors += 1
+                        logger.exception("Error executing on_window callback during flush")
             if self.incident_manager is not None:
-                self.incident_manager.flush()
+                try:
+                    self.incident_manager.flush()
+                except Exception:
+                    self._errors += 1
+                    logger.exception("Error flushing incident manager")
             if self.parser is not None:
-                self.parser.save()
+                try:
+                    self.parser.save()
+                except Exception:
+                    self._errors += 1
+                    logger.exception("Error saving parser during flush")
+
+    @property
+    def errors(self) -> int:
+        with self._lock:
+            return self._errors
 
     @property
     def event_count(self) -> int:

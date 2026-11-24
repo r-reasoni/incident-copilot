@@ -24,6 +24,8 @@ shipper = configure_file_logger(SERVICE)
 faults = FaultController()
 request_samples: deque[tuple[float, float, int]] = deque()
 sample_lock = threading.Lock()
+in_flight_requests: int = 0
+in_flight_lock = threading.Lock()
 process = psutil.Process()
 process.cpu_percent(None)
 RANDOM = random.Random()
@@ -69,8 +71,11 @@ def _should_skip_logging(path: str) -> bool:
 
 @app.middleware("http")
 async def observe_requests(request: Request, call_next):
+    global in_flight_requests
     started = time.perf_counter()
     path = request.url.path
+    with in_flight_lock:
+        in_flight_requests += 1
     try:
         kind, params = faults.snapshot()
         if not path.startswith("/_fault/"):
@@ -111,6 +116,9 @@ async def observe_requests(request: Request, call_next):
         if not _should_skip_logging(path):
             shipper.log("ERROR", f"Request handler failed with {type(error).__name__}")
         raise
+    finally:
+        with in_flight_lock:
+            in_flight_requests = max(0, in_flight_requests - 1)
 
 
 def _json_error(status: int, detail: str):
@@ -175,6 +183,9 @@ def metrics() -> dict[str, Any]:
             request_samples.popleft()
         latencies = sorted(sample[1] for sample in request_samples)
         errors = sum(1 for sample in request_samples if sample[2] >= 400)
+        req_count_30s = len(request_samples)
+    with in_flight_lock:
+        current_in_flight = in_flight_requests
     handles = process.num_handles() if hasattr(process, "num_handles") else process.num_fds()
     return {
         "cpu_percent": process.cpu_percent(None),
@@ -184,6 +195,8 @@ def metrics() -> dict[str, Any]:
         "request_latency_p50_ms": _percentile(latencies, 0.50),
         "request_latency_p95_ms": _percentile(latencies, 0.95),
         "error_count_30s": errors,
+        "in_flight_requests": current_in_flight,
+        "request_count_30s": req_count_30s,
     }
 
 

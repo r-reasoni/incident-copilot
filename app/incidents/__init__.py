@@ -1,9 +1,4 @@
-"""
-app/incidents package
-=====================
-Incident aggregation, life-cycle tracking, evidence pack creation.
-"""
+# Incident storage and management package
 from app.incidents.evidence import build_evidence_pack
-from app.incidents.manager import IncidentManager, IncidentRecord
 
-__all__ = ["IncidentManager", "IncidentRecord", "build_evidence_pack"]
+__all__ = ["build_evidence_pack"]

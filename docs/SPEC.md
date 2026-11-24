@@ -174,6 +174,29 @@ Fault events are never exposed to the investigation agent.
 | `started_at` | `TIMESTAMPTZ NOT NULL` | |
 | `ended_at` | `TIMESTAMPTZ` | Nullable while a fault is active |
 
+### 3.6 `metrics_samples`
+
+Host and service metrics samples collected periodically from target services.
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | `BIGSERIAL PK` | |
+| `ts` | `TIMESTAMPTZ NOT NULL` | Sample timestamp |
+| `service` | `TEXT NOT NULL` | Target service name |
+| `cpu_percent` | `FLOAT NOT NULL` | Process/container CPU utilization % |
+| `mem_percent` | `FLOAT NOT NULL` | Memory utilization % |
+| `open_handles` | `INT NOT NULL` | Number of open file descriptors/handles |
+| `threads` | `INT NOT NULL` | Thread count |
+| `p50_ms` | `FLOAT NOT NULL` | 50th percentile response latency in ms |
+| `p95_ms` | `FLOAT NOT NULL` | 95th percentile response latency in ms |
+| `error_count` | `INT NOT NULL` | Count of service errors |
+| `in_flight_requests` | `INT NOT NULL` | Current in-flight request count |
+| `request_count_30s` | `INT NOT NULL` | Requests served in the last 30s |
+| `probe_ms` | `FLOAT` | Nullable health probe latency in ms |
+| `probe_ok` | `BOOLEAN NOT NULL` | Health probe success flag |
+
+Indexes: `(service, ts)`.
+
 ---
 
 ## 4. Feature Vector Specification

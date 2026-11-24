@@ -68,3 +68,38 @@ async def test_fastapi_lifespan_ticks_and_flushes() -> None:
 
     # After lifespan exits, flush() must have been called
     assert pipeline.is_flushed
+
+
+def test_pipeline_catches_callback_exceptions_and_increments_errors() -> None:
+    """Pipeline must catch callback and tick/flush exceptions, log them, increment errors, and not crash."""
+    def buggy_callback(res):
+        raise RuntimeError("Callback crash simulation")
+
+    pipeline = Pipeline(on_window=[buggy_callback])
+    # Process enough events to close a window or call tick
+    for i in range(50):
+        pipeline.process({
+            "ts": datetime(2026, 11, 21, 10, 0, i, tzinfo=UTC),
+            "service": "api-service",
+            "host": "localhost",
+            "level": "INFO",
+            "message": f"msg {i}",
+        })
+    pipeline.tick(datetime(2026, 11, 21, 10, 1, 0, tzinfo=UTC))
+    pipeline.flush()
+
+    assert pipeline.errors > 0, "Pipeline must catch exceptions and increment errors counter"
+
+
+def test_threshold_fallback_low_history_does_not_crash() -> None:
+    """Threshold computation with few or identical values does not crash and respects bounds."""
+    from app.detection.detector import AnomalyDetector
+    detector = AnomalyDetector(warmup_windows=5, save_to_db=False)
+    # Empty history
+    assert detector._compute_threshold() is None
+    # Add identical scores
+    detector._score_history.extend([0.05, 0.05, 0.05])
+    t = detector._compute_threshold()
+    assert t is not None
+    assert t >= 0.01
+    assert t <= detector.threshold_ceiling

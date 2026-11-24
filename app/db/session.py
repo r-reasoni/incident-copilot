@@ -11,7 +11,7 @@ from app.config import get_settings
 engine = create_engine(
     get_settings().database_url,
     pool_pre_ping=True,
-    connect_args={"connect_timeout": 2},
+    connect_args={"connect_timeout": get_settings().db_connect_timeout},
 )
 SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
 

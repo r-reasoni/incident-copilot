@@ -7,7 +7,7 @@ from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
-from app.db.models import FaultEvent, Incident, LogEvent, Template, WindowScore
+from app.db.models import FaultEvent, Incident, LogEvent, MetricsSample, Template, WindowScore
 
 
 def insert_logs(session: Session, logs: list[dict[str, Any]]) -> list[int]:
@@ -142,3 +142,30 @@ def list_fault_events(session: Session) -> list[FaultEvent]:
     """List evaluation ground-truth events in start-time order."""
     return list(session.scalars(select(FaultEvent).order_by(FaultEvent.started_at, FaultEvent.id)))
 
+
+
+def insert_metrics_sample(session: Session, **values: Any) -> MetricsSample:
+    """Insert a single host/probe metrics sample."""
+    sample = MetricsSample(**values)
+    session.add(sample)
+    session.flush()
+    return sample
+
+
+def get_metrics(
+    session: Session,
+    service: str,
+    start: datetime,
+    end: datetime,
+) -> list[MetricsSample]:
+    """Retrieve metrics samples for a service within [start, end) in time order."""
+    statement = (
+        select(MetricsSample)
+        .where(
+            MetricsSample.service == service,
+            MetricsSample.ts >= start,
+            MetricsSample.ts < end,
+        )
+        .order_by(MetricsSample.ts.asc(), MetricsSample.id.asc())
+    )
+    return list(session.scalars(statement))

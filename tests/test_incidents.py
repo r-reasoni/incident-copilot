@@ -241,9 +241,16 @@ def test_evidence_pack_size_and_privacy() -> None:
     assert "time_range" in pack
     assert "duration_seconds" in pack
     assert "affected_services" in pack
+    assert "service_error_rates" in pack
+    assert "ratio_floor" in pack
     assert "baseline_vs_incident" in pack
     assert "top_templates" in pack
     assert "peak_window_features" in pack
+
+    for t in pack["top_templates"]:
+        if isinstance(t, dict) and "template_id" in t:
+            assert "is_new" in t
+            assert "absent_in_baseline" in t
 
     # 2. Max 8 top templates
     assert len(pack["top_templates"]) <= 8

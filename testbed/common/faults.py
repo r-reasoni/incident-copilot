@@ -10,6 +10,10 @@ from typing import Any
 
 
 def _cpu_worker() -> None:
+    try:
+        os.nice(15)
+    except Exception:
+        pass
     while True:
         cycle = time.perf_counter()
         while time.perf_counter() - cycle < 0.08:
@@ -50,7 +54,7 @@ class FaultController:
             self._stop_event.clear()
 
             if kind == "cpu_hog":
-                process_count = max(1, round((os.cpu_count() or 1) * 0.8))
+                process_count = max(1, round((os.cpu_count() or 1) * 0.5))
                 self._cpu_workers = [
                     multiprocessing.Process(target=_cpu_worker, daemon=True)
                     for _ in range(process_count)
@@ -97,9 +101,15 @@ class FaultController:
         with self.lock:
             self._stop_event.set()
             for worker in self._cpu_workers:
-                if worker.is_alive():
-                    worker.terminate()
-                worker.join(timeout=1)
+                try:
+                    if worker.is_alive():
+                        worker.terminate()
+                    worker.join(timeout=1)
+                    if worker.is_alive():
+                        worker.kill()
+                        worker.join(timeout=1)
+                except Exception:
+                    pass
             self._cpu_workers.clear()
             if self._memory_thread and self._memory_thread.is_alive():
                 self._memory_thread.join(timeout=1)

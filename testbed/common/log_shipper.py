@@ -24,6 +24,7 @@ class LogShipper:
         self.service = service
         self.host = socket.gethostname()
         self._buffer: deque[dict[str, Any]] = deque(maxlen=MAX_BUFFER)
+        self.dropped_logs: int = 0
         self._lock = threading.Lock()
         self._file_lock = threading.Lock()
         self._stop = threading.Event()
@@ -48,6 +49,12 @@ class LogShipper:
             "message": message,
         }
         with self._lock:
+            if len(self._buffer) >= MAX_BUFFER:
+                self.dropped_logs += 1
+                if self.dropped_logs == 1 or self.dropped_logs % 100 == 0:
+                    logging.getLogger(self.service).warning(
+                        "LogShipper dropped %d logs due to full buffer", self.dropped_logs
+                    )
             self._buffer.append(record)
             should_send = len(self._buffer) >= MAX_BATCH
         if should_send:

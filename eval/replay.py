@@ -27,10 +27,10 @@ from app.pipeline import Pipeline
 
 
 def truncate_replay_tables() -> None:
-    """Truncate log_events, templates, window_scores, and incidents ONLY."""
+    """Truncate log_events, templates, window_scores, incidents, and metrics_samples."""
     with SessionLocal() as session, session.begin():
         session.execute(
-            text("TRUNCATE TABLE log_events, templates, window_scores, incidents RESTART IDENTITY CASCADE;")
+            text("TRUNCATE TABLE log_events, templates, window_scores, incidents, metrics_samples RESTART IDENTITY CASCADE;")
         )
 
 
@@ -42,21 +42,37 @@ def reset_drain_state() -> None:
         print(f"Removed Drain state at {drain_path}")
 
 
+def load_metrics_samples(metrics_path: Path) -> int:
+    """Load pre-recorded metrics samples into metrics_samples table."""
+    from app.db.repository import insert_metrics_sample
+    count = 0
+    with metrics_path.open("r", encoding="utf-8") as f, SessionLocal() as session, session.begin():
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            data = json.loads(line)
+            if "ts" in data and isinstance(data["ts"], str):
+                data["ts"] = _parse_event_ts(data["ts"])
+            insert_metrics_sample(session, **data)
+            count += 1
+    print(f"Loaded {count} metrics samples from {metrics_path}.")
+    return count
+
+
 def replay(
     events_path: Path,
     faults_path: Path | None = None,
+    metrics_path: Path | None = None,
     batch_size: int = 100,
     truncate_after_faults: int = 150,
 ) -> list[Any]:
-    """Execute event-time replay of recorded logs through ingest_batch.
-
-    Note:
-        When --faults is provided, events arriving more than truncate_after_faults seconds
-        after the last injected fault ends are discarded. Trailing silence after an experiment
-        is not part of the evaluation.
-    """
+    """Execute event-time replay of recorded logs through ingest_batch."""
     truncate_replay_tables()
     reset_drain_state()
+
+    if metrics_path and metrics_path.exists():
+        load_metrics_samples(metrics_path)
 
     # Pre-parse faults if provided to determine truncation cutoff
     faults: list[dict[str, Any]] = []
@@ -121,6 +137,20 @@ def replay(
     incidents = incident_manager.list_incidents()
     print(f"\nReplay complete. Found {len(incidents)} incidents.")
 
+    from app.agent.agent import run_agent
+    from app.db import repository
+    print(f"Executing root-cause agent on {len(incidents)} incidents sequentially...")
+    for inc in incidents:
+        try:
+            run_agent(inc.id)
+        except Exception as exc:
+            print(f"Agent analysis failed for incident {inc.id}: {exc}")
+
+    with SessionLocal() as session:
+        db_incidents = repository.list_incidents(session)
+    if db_incidents:
+        incidents = db_incidents
+
     print_incident_table(incidents, faults)
     return incidents
 
@@ -154,6 +184,10 @@ def print_incident_table(incidents: list[Any], faults: list[dict[str, Any]]) -> 
         peak_score = inc.peak_score
         affected = inc.affected_services
         top_tpls = getattr(inc, "top_templates", [])
+        if isinstance(top_tpls, dict):
+            top_tpls = top_tpls.get("top_templates", top_tpls.get("templates", []))
+        if not isinstance(top_tpls, list):
+            top_tpls = []
 
         # Match against faults (overlap with fault interval +/- 20s)
         matching_fault = None
@@ -177,8 +211,27 @@ def print_incident_table(incidents: list[Any], faults: list[dict[str, Any]]) -> 
         print(f"                Ended:    {ended.isoformat() if ended else 'N/A'}")
         print(f"  Affected Svc: {affected}")
 
+        trace = getattr(inc, "agent_trace", {}) or {}
+        tool_calls = [tc.get("tool", tc.get("name")) for tc in trace.get("tool_calls", [])]
+        print(f"  Agent Diag  : Category:   {inc.category}")
+        print(f"                Confidence: {inc.confidence}")
+        print(f"                LLM Calls:  {inc.llm_calls}")
+        print(f"                Tools Used: {', '.join(tool_calls) if tool_calls else 'None'}")
+        print(f"                Root Cause: {inc.root_cause}")
+        if "error" in trace:
+            print(f"                Error/RateLimit: {trace['error']}")
+
+        fault_to_cat = {
+            "cpu_hog": "cpu",
+            "memory_leak": "memory",
+            "db_lock": "db_lock",
+            "packet_loss": "packet_loss",
+            "latency": "network_latency",
+        }
         if matching_fault:
-            print(f"  Matching Flt: {matching_fault['fault_type']} on {matching_fault['target_service']} (delay: {delay_s}s)")
+            exp_cat = fault_to_cat.get(matching_fault["fault_type"])
+            matches = (inc.category == exp_cat)
+            print(f"  Matching Flt: {matching_fault['fault_type']} (expected: {exp_cat}) | Category Match: {matches}")
         else:
             print("  Matching Flt: NONE (Unmatched incident)")
 
@@ -206,6 +259,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Replay recorded events through shared ingest_batch.")
     parser.add_argument("events", type=Path, help="Path to events.jsonl")
     parser.add_argument("--faults", type=Path, default=None, help="Optional path to faults.json")
+    parser.add_argument("--metrics", type=Path, default=None, help="Optional path to metrics.jsonl")
     parser.add_argument("--yes", action="store_true", help="Confirm table truncation")
     parser.add_argument("--batch-size", type=int, default=100, help="Batch size for ingestion")
     parser.add_argument(
@@ -227,6 +281,7 @@ def main() -> None:
     replay(
         args.events,
         faults_path=args.faults,
+        metrics_path=args.metrics,
         batch_size=args.batch_size,
         truncate_after_faults=args.truncate_after_faults,
     )

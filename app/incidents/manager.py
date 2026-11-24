@@ -730,8 +730,12 @@ class IncidentManager:
                 })
             incident.affected_services = affected
             incident.affected_services_rates = affected_rates
+            incident.service_error_rates = affected_rates
 
             # 2. Top templates (max 8) via SQL aggregation
+            # Ratio floor: when baseline rate is 0, use 1 / baseline_dur as the denominator
+            ratio_floor = round(1.0 / baseline_dur, 6) if baseline_dur > 0 else 0.001
+            incident.ratio_floor = ratio_floor
             tpl_inc_stmt = (
                 select(LogEvent.template_id, LogEvent.level, func.count().label("cnt"))
                 .where(
@@ -807,9 +811,11 @@ class IncidentManager:
                 if b_rate > 0:
                     ratio = round(i_rate / b_rate, 2)
                 else:
-                    ratio = round(i_rate / (1.0 / baseline_dur), 2) if i_rate > 0 else 0.0
+                    # Documented ratio floor: 1 / baseline_seconds prevents division by zero
+                    ratio = round(i_rate / ratio_floor, 2) if i_rate > 0 else 0.0
 
                 is_new = prior_counts.get(tid, 0) == 0
+                absent_in_baseline = (b_cnt == 0)
                 t_text = tpl_texts.get(tid) or self._template_texts.get(tid) or f"Template {tid}"
                 exs = example_lines.get(tid) or list(self._template_examples.get(tid, []))[:3]
 
@@ -822,6 +828,7 @@ class IncidentManager:
                     "level_mix": dict(level_mix[tid]),
                     "examples": exs,
                     "is_new": is_new,
+                    "absent_in_baseline": absent_in_baseline,
                     "_sort_key": (i_rate - b_rate, ratio),
                 })
             top_items.sort(key=lambda t: t["_sort_key"], reverse=True)
@@ -896,6 +903,11 @@ class IncidentManager:
             })
         incident.affected_services = affected
         incident.affected_services_rates = affected_rates
+        incident.service_error_rates = affected_rates
+
+        # Ratio floor: when baseline rate is 0, floor baseline rate at 1 / baseline_dur
+        ratio_floor = round(1.0 / baseline_dur, 6) if baseline_dur > 0 else 0.001
+        incident.ratio_floor = ratio_floor
 
         # 2. Top templates
         inc_tpl_counts: Counter[int] = Counter()
@@ -928,8 +940,9 @@ class IncidentManager:
             b_cnt = base_tpl_counts[tid]
             b_rate = b_cnt / baseline_dur
             i_rate = i_cnt / incident_dur
-            ratio = round(i_rate / b_rate, 2) if b_rate > 0 else (round(i_rate / (1.0 / baseline_dur), 2) if i_rate > 0 else 0.0)
+            ratio = round(i_rate / b_rate, 2) if b_rate > 0 else (round(i_rate / ratio_floor, 2) if i_rate > 0 else 0.0)
             is_new = prior_tpl_counts[tid] == 0
+            absent_in_baseline = (b_cnt == 0)
             t_text = self._template_texts.get(tid) or f"Template {tid}"
             exs = example_lines[tid] or list(self._template_examples.get(tid, []))[:3]
 
@@ -942,6 +955,7 @@ class IncidentManager:
                 "level_mix": dict(level_mix[tid]),
                 "examples": exs,
                 "is_new": is_new,
+                "absent_in_baseline": absent_in_baseline,
                 "_sort_key": (i_rate - b_rate, ratio),
             })
         top_items.sort(key=lambda t: t["_sort_key"], reverse=True)

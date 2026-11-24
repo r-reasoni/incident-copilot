@@ -29,6 +29,7 @@ class Settings:
             "DATABASE_URL",
             "postgresql+psycopg://postgres:postgres@localhost:5432/incident_copilot",
         )
+        self.db_connect_timeout = int(os.getenv("DB_CONNECT_TIMEOUT", "5"))
         self.window_seconds = int(os.getenv("WINDOW_SECONDS", "10"))
         self.warmup_windows = int(os.getenv("WARMUP_WINDOWS", "30"))
         self.anomaly_gap_seconds = int(os.getenv("ANOMALY_GAP_SECONDS", "30"))
@@ -45,6 +46,9 @@ class Settings:
         self.incident_cooldown_seconds = int(os.getenv("INCIDENT_COOLDOWN_SECONDS", "60"))
         self.evidence_max_seconds = int(os.getenv("EVIDENCE_MAX_SECONDS", "300"))
         self.max_agent_tool_calls = int(os.getenv("MAX_AGENT_TOOL_CALLS", "5"))
+        self.metrics_targets = os.getenv("METRICS_TARGETS", "api-service=http://localhost:8101,worker-service=http://localhost:8102")
+        self.metrics_sample_seconds = int(os.getenv("METRICS_SAMPLE_SECONDS", "5"))
+        self.record_metrics_path = os.getenv("RECORD_METRICS_PATH", "")
         self.drain_state_path = os.getenv("DRAIN_STATE_PATH", "data/drain_state.bin")
         self.metrics_sample_seconds = int(os.getenv("METRICS_SAMPLE_SECONDS", "5"))
         self.record_events_path = os.getenv("RECORD_EVENTS_PATH", "")
@@ -65,6 +69,16 @@ class Settings:
             effective_hst_window = min(HST_WINDOW_SIZE, max(5, WARMUP_WINDOWS // 2))
         """
         return min(self.hst_window_size, max(5, self.warmup_windows // 2))
+
+
+    def get_metrics_targets(self) -> dict[str, str]:
+        targets: dict[str, str] = {}
+        for pair in self.metrics_targets.split(","):
+            pair = pair.strip()
+            if "=" in pair:
+                k, v = pair.split("=", 1)
+                targets[k.strip()] = v.strip()
+        return targets
 
     def __getattr__(self, name: str) -> Any:
         lower = name.lower()

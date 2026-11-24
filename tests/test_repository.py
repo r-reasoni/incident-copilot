@@ -59,13 +59,14 @@ def db_session(isolated_engine) -> Iterator[Session]:
             yield session
 
 
-def test_schema_has_exactly_five_tables(isolated_engine) -> None:
+def test_schema_has_exactly_six_tables(isolated_engine) -> None:
     assert set(inspect(isolated_engine).get_table_names()) == {
         "log_events",
         "templates",
         "window_scores",
         "incidents",
         "fault_events",
+        "metrics_samples",
     }
 
 
@@ -201,3 +202,36 @@ def test_fault_events_are_listed_for_evaluation(db_session: Session) -> None:
     assert len(events) == 1
     assert events[0].id == fault_event.id
     assert events[0].target_service == "payments"
+
+def test_insert_metrics_sample_and_get_metrics(db_session: Session) -> None:
+    t0 = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+    sample = repository.insert_metrics_sample(
+        db_session,
+        ts=t0,
+        service="api-service",
+        cpu_percent=45.2,
+        mem_percent=60.1,
+        open_handles=120,
+        threads=8,
+        p50_ms=12.5,
+        p95_ms=45.0,
+        error_count=2,
+        in_flight_requests=3,
+        request_count_30s=50,
+        probe_ms=5.4,
+        probe_ok=True,
+    )
+    assert sample.id is not None
+    assert sample.service == "api-service"
+    assert sample.in_flight_requests == 3
+    assert sample.request_count_30s == 50
+
+    metrics = repository.get_metrics(
+        db_session,
+        service="api-service",
+        start=t0 - timedelta(minutes=1),
+        end=t0 + timedelta(minutes=1),
+    )
+    assert len(metrics) == 1
+    assert metrics[0].cpu_percent == 45.2
+    assert metrics[0].probe_ok is True
