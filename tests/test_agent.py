@@ -501,3 +501,132 @@ def test_reanalyze_cli(monkeypatch):
     count = reanalyze_all_closed(force=True)
     assert count == 1
     assert executed_ids == [("201", True)]
+
+
+def test_replay_truncation_default():
+    """Verify that replay truncation default is 120 seconds in both function and CLI."""
+    import argparse
+    import inspect
+    from unittest.mock import patch
+    from eval.replay import replay
+
+    sig = inspect.signature(replay)
+    assert sig.parameters["truncate_after_faults"].default == 120
+    assert "agent_out" in sig.parameters
+
+    recorded_defaults = {}
+    original_add_arg = argparse.ArgumentParser.add_argument
+
+    def track_add_argument(self, *args, **kwargs):
+        if "--truncate-after-faults" in args:
+            recorded_defaults["truncate_after_faults"] = kwargs.get("default")
+        if "--agent-out" in args:
+            recorded_defaults["agent_out"] = True
+        return original_add_arg(self, *args, **kwargs)
+
+    with patch.object(argparse.ArgumentParser, "add_argument", track_add_argument):
+        from eval.replay import main
+        with patch("argparse.ArgumentParser.parse_args", side_effect=SystemExit(0)):
+            try:
+                main()
+            except SystemExit:
+                pass
+
+    assert recorded_defaults.get("truncate_after_faults") == 120
+    assert recorded_defaults.get("agent_out") is True
+
+
+def test_agent_out_schema(tmp_path):
+    """Verify that --agent-out writes the required schema without fault_events data."""
+    import json
+    from datetime import datetime, timezone
+    from pathlib import Path
+    from unittest.mock import MagicMock, patch
+    from app.db.models import Incident
+    from eval.replay import replay
+
+    out_file = tmp_path / "agent_output.json"
+
+    dummy_inc = Incident(
+        id=10,
+        started_at=datetime(2026, 11, 24, 12, 0, 0, tzinfo=timezone.utc),
+        detected_at=datetime(2026, 11, 24, 12, 0, 20, tzinfo=timezone.utc),
+        ended_at=datetime(2026, 11, 24, 12, 1, 0, tzinfo=timezone.utc),
+        status="analyzed",
+        peak_score=0.95,
+        affected_services=["api-service"],
+        category="cpu",
+        confidence=0.9,
+        root_cause="CPU starvation caused by computation-heavy workload",
+        alternatives=[{"category": "application_bug", "reason": "Busy spin loop"}],
+        remediation=[{"step": "Scale out CPU", "risk": "low"}],
+        llm_calls=2,
+        agent_trace={
+            "agent_status": "ok",
+            "model_used": "gemini-3.5-flash-lite",
+            "llm_calls": 2,
+            "tool_calls": [
+                {"tool": "get_host_metrics", "args": {}},
+                {"tool": "get_network_stats", "args": {}},
+            ],
+            "error": None,
+        },
+    )
+
+    events_file = tmp_path / "events.jsonl"
+    events_file.write_text('{"ts": "2026-11-24T12:00:00+00:00", "service": "api", "level": "INFO", "message": "test"}\n')
+
+    mock_session = MagicMock()
+    mock_session.begin.return_value.__enter__ = MagicMock()
+    mock_session.begin.return_value.__exit__ = MagicMock()
+
+    with patch("eval.replay.truncate_replay_tables"), \
+         patch("eval.replay.reset_drain_state"), \
+         patch("eval.replay.SessionLocal", return_value=mock_session), \
+         patch("app.db.repository.list_incidents", return_value=[dummy_inc]), \
+         patch("eval.replay.print_incident_table"):
+
+        replay(
+            events_path=events_file,
+            agent_out=out_file,
+        )
+
+    assert out_file.exists()
+    with out_file.open("r", encoding="utf-8") as f:
+        records = json.load(f)
+
+    assert isinstance(records, list)
+    assert len(records) == 1
+    rec = records[0]
+
+    required_keys = {
+        "incident_id",
+        "started_at",
+        "detected_at",
+        "ended_at",
+        "agent_status",
+        "model_used",
+        "llm_calls",
+        "tools_used",
+        "category",
+        "alternatives",
+        "confidence",
+        "root_cause",
+        "remediation",
+        "error",
+    }
+    assert required_keys.issubset(rec.keys())
+
+    assert rec["incident_id"] == 10
+    assert rec["agent_status"] == "ok"
+    assert rec["model_used"] == "gemini-3.5-flash-lite"
+    assert rec["llm_calls"] == 2
+    assert rec["tools_used"] == ["get_host_metrics", "get_network_stats"]
+    assert rec["category"] == "cpu"
+    assert rec["confidence"] == 0.9
+    assert rec["root_cause"] == "CPU starvation caused by computation-heavy workload"
+    assert rec["error"] is None
+
+    forbidden_keys = {"fault_type", "target_service", "faults", "fault_events", "ground_truth"}
+    for k in forbidden_keys:
+        assert k not in rec

@@ -140,21 +140,29 @@ def main() -> None:
             print("Confirmed zero flags in steady state.")
 
         # Injects 5 faults in order (memory_leak, db_lock, cpu_hog, packet_loss, latency)
-        # 60s duration, 120s recovery
+        # 60s duration, 120s recovery between faults, 150s after the last fault
         faults_order = ["memory_leak", "db_lock", "cpu_hog", "packet_loss", "latency"]
-        print("\n--- 5. Injecting 5 faults in order (60s duration, 120s recovery) ---")
+        print("\n--- 5. Injecting 5 faults in order (60s duration, 120s recovery between faults) ---")
         for idx, fault_name in enumerate(faults_order, 1):
             print(f"\n[{idx}/5] Injecting fault: {fault_name} (duration 60s)...")
             run_fault(fault_name, "api", duration=60.0, announce=True)
-            print(f"[{idx}/5] Fault {fault_name} finished. Waiting 120s recovery...")
-            for s in range(2):
-                time.sleep(60)
-                print(f"  Recovery elapsed {(s + 1) * 60}s / 120s...")
+            if idx < len(faults_order):
+                print(f"[{idx}/5] Fault {fault_name} finished. Waiting 120s recovery...")
+                for s in range(2):
+                    time.sleep(60)
+                    print(f"  Recovery elapsed {(s + 1) * 60}s / 120s...")
+            else:
+                print(f"[{idx}/5] Last fault {fault_name} finished. Keeping loadgen active for 150s observation...")
+                for s in range(2):
+                    time.sleep(60)
+                    print(f"  Observation elapsed {(s + 1) * 60}s / 150s...")
+                time.sleep(30)
+                print("  Observation elapsed 150s / 150s.")
 
-        print("\nAll 5 faults and 120s recovery completed.")
+        print("\nAll 5 faults and observation window completed.")
 
-        # Stop loadgen so recording stops precisely after recovery
-        print("Stopping loadgen after last recovery...")
+        # Stop loadgen so loadgen and recording end at the exact same moment
+        print("Stopping loadgen concurrently with end of recording window...")
         if proc_loadgen and proc_loadgen.poll() is None:
             proc_loadgen.terminate()
             try:
@@ -162,10 +170,6 @@ def main() -> None:
             except Exception:
                 pass
             proc_loadgen = None
-
-        # Wait remaining 30s to hit exactly last fault end + 150 seconds
-        print("Waiting remaining 30s to complete 150s post-fault observation window...")
-        time.sleep(30)
 
         # Flush pipeline and wait for background agents
         print("\n--- 6. Flushing pipeline and waiting for agent analysis ---")

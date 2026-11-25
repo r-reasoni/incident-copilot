@@ -294,6 +294,12 @@ The harness measures:
 - **Deterministic Event-Time Evaluation**: Replay processes events strictly according to their recorded `event["ts"]` timestamps, advancing the pipeline clock deterministically. Two runs of `eval.replay` over the exact same log file produce 100% identical window scores, thresholds, flags, and incident groupings.
 - **The `memory_leak` Divergence (Case Study)**: In the Step 5 benchmark run, `memory_leak` produced 0 anomalous flags during the live run, but 1 anomalous flag during offline replay. In the live run, logging transport jitter split the cluster of memory-leak warning logs across two consecutive wall-clock windows (diluting the log rate and feature mass below the anomaly threshold). In replay, event-time alignment placed the burst into its true 10-second event interval, elevating the feature vector and crossing the threshold. Because ground truth is based on the system's actual events, deterministic event-time replay represents the true evaluation standard.
 
+### 8.2 Replay Truncation & Harness Artifact Prevention
+
+- **Loadgen Synchronization**: In `eval/run_step7.py`, traffic generation (`loadgen`) runs continuously until the post-fault observation window finishes (last fault end + 150 seconds). Both load generation and log recording terminate concurrently so that abrupt traffic drops do not generate false positive incidents.
+- **Replay Truncation Default**: In `eval/replay.py`, `--truncate-after-faults` defaults to 120 seconds after the final fault ends. Events logged beyond this 120-second recovery boundary represent testbed teardown and process exit artifacts, which are excluded from offline benchmark evaluations.
+- **Per-Provider Agent Output**: In `eval/replay.py`, `--agent-out <path>` writes structured per-incident agent diagnostics (incident metadata, status, model used, tool calls, category, confidence, root cause, remediation, and errors) without ground-truth fault labels to decouple analysis recording from evaluation scoring.
+
 ---
 
 ## 9. Configuration Reference

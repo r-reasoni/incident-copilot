@@ -1,0 +1,134 @@
+[
+  {
+    "incident_id": 1,
+    "started_at": "2026-11-24T17:26:50+05:30",
+    "detected_at": "2026-11-24T17:27:10+05:30",
+    "ended_at": "2026-11-24T17:28:10+05:30",
+    "agent_status": "ok",
+    "model_used": "mock",
+    "llm_calls": 1,
+    "tools_used": [
+      "get_host_metrics",
+      "get_network_stats"
+    ],
+    "category": "network_latency",
+    "alternatives": [
+      {
+        "reason": "Downstream dependency latency degradation",
+        "category": "application_bug"
+      }
+    ],
+    "confidence": 0.85,
+    "root_cause": "Elevated network latency causing high end-to-end request duration",
+    "remediation": [
+      {
+        "risk": "low",
+        "step": "Check upstream network hops and egress latency across routing paths"
+      },
+      {
+        "risk": "low",
+        "step": "Adjust client request timeouts and connection pooling parameters"
+      }
+    ],
+    "error": null
+  },
+  {
+    "incident_id": 2,
+    "started_at": "2026-11-24T17:30:00+05:30",
+    "detected_at": "2026-11-24T17:30:20+05:30",
+    "ended_at": "2026-11-24T17:31:10+05:30",
+    "agent_status": "ok",
+    "model_used": "mock",
+    "llm_calls": 1,
+    "tools_used": [
+      "get_host_metrics",
+      "get_network_stats"
+    ],
+    "category": "cpu",
+    "alternatives": [
+      {
+        "reason": "Inefficient algorithm or busy-waiting thread loop",
+        "category": "application_bug"
+      }
+    ],
+    "confidence": 0.9,
+    "root_cause": "CPU starvation caused by computation-heavy workload or busy spin loop",
+    "remediation": [
+      {
+        "risk": "low",
+        "step": "Scale out service replicas or increase CPU allocation"
+      },
+      {
+        "risk": "med",
+        "step": "Profile hot methods to identify computational bottleneck"
+      }
+    ],
+    "error": null
+  },
+  {
+    "incident_id": 3,
+    "started_at": "2026-11-24T17:33:00+05:30",
+    "detected_at": "2026-11-24T17:33:20+05:30",
+    "ended_at": "2026-11-24T17:34:10+05:30",
+    "agent_status": "ok",
+    "model_used": "mock",
+    "llm_calls": 1,
+    "tools_used": [
+      "get_host_metrics",
+      "get_network_stats"
+    ],
+    "category": "memory",
+    "alternatives": [
+      {
+        "reason": "Unbounded cache or object collection retention",
+        "category": "application_bug"
+      }
+    ],
+    "confidence": 0.9,
+    "root_cause": "Memory leak or memory exhaustion due to uncollected object accumulation",
+    "remediation": [
+      {
+        "risk": "med",
+        "step": "Restart service container to immediately reclaim system memory"
+      },
+      {
+        "risk": "low",
+        "step": "Capture and inspect heap dump for retained references"
+      }
+    ],
+    "error": null
+  },
+  {
+    "incident_id": 4,
+    "started_at": "2026-11-24T17:36:00+05:30",
+    "detected_at": "2026-11-24T17:36:20+05:30",
+    "ended_at": "2026-11-24T17:37:10+05:30",
+    "agent_status": "ok",
+    "model_used": "mock",
+    "llm_calls": 1,
+    "tools_used": [
+      "get_host_metrics",
+      "get_network_stats"
+    ],
+    "category": "network_latency",
+    "alternatives": [
+      {
+        "reason": "Downstream dependency latency degradation",
+        "category": "application_bug"
+      }
+    ],
+    "confidence": 0.85,
+    "root_cause": "Elevated network latency causing high end-to-end request duration",
+    "remediation": [
+      {
+        "risk": "low",
+        "step": "Check upstream network hops and egress latency across routing paths"
+      },
+      {
+        "risk": "low",
+        "step": "Adjust client request timeouts and connection pooling parameters"
+      }
+    ],
+    "error": null
+  }
+]

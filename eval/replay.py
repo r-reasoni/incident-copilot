@@ -65,7 +65,8 @@ def replay(
     faults_path: Path | None = None,
     metrics_path: Path | None = None,
     batch_size: int = 100,
-    truncate_after_faults: int = 150,
+    truncate_after_faults: int = 120,
+    agent_out: Path | None = None,
 ) -> list[Any]:
     """Execute event-time replay of recorded logs through ingest_batch."""
     truncate_replay_tables()
@@ -154,6 +155,71 @@ def replay(
         db_incidents = repository.list_incidents(session)
     if db_incidents:
         incidents = db_incidents
+
+    # Sort chronologically ascending
+    incidents = sorted(incidents, key=lambda inc: (inc.started_at, inc.id))
+
+    if agent_out is not None:
+        agent_records = []
+        for inc in incidents:
+            trace = inc.agent_trace if isinstance(inc.agent_trace, dict) else {}
+            tool_calls = trace.get("tool_calls", [])
+            tools_used = []
+            for tc in tool_calls:
+                if isinstance(tc, dict):
+                    tool_name = tc.get("tool") or tc.get("name") or (tc.get("function", {}).get("name") if isinstance(tc.get("function"), dict) else None)
+                    if tool_name:
+                        tools_used.append(tool_name)
+                elif isinstance(tc, str):
+                    tools_used.append(tc)
+
+            agent_status = trace.get("agent_status") or inc.status
+            model_used = trace.get("model_used")
+            llm_calls = inc.llm_calls if inc.llm_calls is not None else trace.get("llm_calls", 0)
+            category = inc.category
+            alternatives = inc.alternatives
+            if isinstance(alternatives, dict) and "alternatives" in alternatives:
+                alternatives = alternatives["alternatives"]
+            confidence = inc.confidence
+            root_cause = inc.root_cause
+            remediation = inc.remediation
+            if isinstance(remediation, dict) and "remediation" in remediation:
+                remediation = remediation["remediation"]
+            elif isinstance(remediation, dict) and "steps" in remediation:
+                remediation = remediation["steps"]
+            error = trace.get("error")
+
+            record = {
+                "incident_id": inc.id,
+                "started_at": inc.started_at.isoformat() if inc.started_at else None,
+                "detected_at": inc.detected_at.isoformat() if inc.detected_at else None,
+                "ended_at": (
+                    inc.ended_at.isoformat()
+                    if getattr(inc, "ended_at", None)
+                    else (
+                        inc.last_anomalous_end.isoformat()
+                        if getattr(inc, "last_anomalous_end", None)
+                        else None
+                    )
+                ),
+                "agent_status": agent_status,
+                "model_used": model_used,
+                "llm_calls": llm_calls,
+                "tools_used": tools_used,
+                "category": category,
+                "alternatives": alternatives,
+                "confidence": confidence,
+                "root_cause": root_cause,
+                "remediation": remediation,
+                "error": error,
+            }
+            agent_records.append(record)
+
+        agent_out_path = Path(agent_out)
+        agent_out_path.parent.mkdir(parents=True, exist_ok=True)
+        with agent_out_path.open("w", encoding="utf-8") as f:
+            json.dump(agent_records, f, indent=2)
+        print(f"Wrote {len(agent_records)} agent incident records to {agent_out_path}")
 
     print_incident_table(incidents, faults)
     return incidents
@@ -277,8 +343,14 @@ def main() -> None:
     parser.add_argument(
         "--truncate-after-faults",
         type=int,
-        default=150,
-        help="Stop feeding events SECONDS after last fault ended (default: 150)",
+        default=120,
+        help="Stop feeding events SECONDS after last fault ended (default: 120)",
+    )
+    parser.add_argument(
+        "--agent-out",
+        type=Path,
+        default=None,
+        help="Optional path to write agent JSON outputs per incident",
     )
 
     args = parser.parse_args()
@@ -301,6 +373,7 @@ def main() -> None:
         metrics_path=args.metrics,
         batch_size=args.batch_size,
         truncate_after_faults=args.truncate_after_faults,
+        agent_out=args.agent_out,
     )
 
 

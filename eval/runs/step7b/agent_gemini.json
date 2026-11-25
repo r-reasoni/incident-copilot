@@ -1,0 +1,161 @@
+[
+  {
+    "incident_id": 1,
+    "started_at": "2026-11-24T17:26:50+05:30",
+    "detected_at": "2026-11-24T17:27:10+05:30",
+    "ended_at": "2026-11-24T17:28:10+05:30",
+    "agent_status": "ok",
+    "model_used": "gemini-3.5-flash-lite",
+    "llm_calls": 6,
+    "tools_used": [
+      "query_logs",
+      "get_host_metrics",
+      "get_host_metrics",
+      "get_network_stats",
+      "recent_changes"
+    ],
+    "category": "db_lock",
+    "alternatives": [
+      {
+        "reason": "Could be mistaken for an unhandled exception or deadlock bug, but the specific delay-and-resume persistence logs point directly to database-level lock contention.",
+        "category": "application_bug"
+      },
+      {
+        "reason": "High p95 request duration might suggest network issues, but the presence of order persistence delay messages confirms backend database lock rather than network transit delays.",
+        "category": "network_latency"
+      }
+    ],
+    "confidence": 0.95,
+    "root_cause": "A database lock contention issue occurred, causing slow requests (POST /orders and GET /users/<NUM>) and timeouts during transaction persistence, followed by resumed persistence after delays.",
+    "remediation": [
+      {
+        "risk": "low",
+        "step": "Inspect active database transactions and query locks during the incident window to identify long-running or blocking queries."
+      },
+      {
+        "risk": "med",
+        "step": "Optimize indexing and transaction isolation levels for the orders and users tables to reduce lock contention."
+      }
+    ],
+    "error": null
+  },
+  {
+    "incident_id": 2,
+    "started_at": "2026-11-24T17:30:00+05:30",
+    "detected_at": "2026-11-24T17:30:20+05:30",
+    "ended_at": "2026-11-24T17:31:10+05:30",
+    "agent_status": "ok",
+    "model_used": "gemini-3.5-flash-lite",
+    "llm_calls": 6,
+    "tools_used": [
+      "get_host_metrics",
+      "get_host_metrics",
+      "get_network_stats",
+      "recent_changes",
+      "query_log_templates"
+    ],
+    "category": "cpu",
+    "alternatives": [
+      {
+        "reason": "While request latency increased, network probe metrics showed the probe latency also jumped to a mean of 654.96ms, but host CPU metrics clearly showed exhaustive CPU saturation as the primary driver.",
+        "category": "network_latency"
+      },
+      {
+        "reason": "Log warnings for slow requests could indicate an algorithmic regression, but the direct correlation with 99.4% peak CPU usage points to CPU resource contention.",
+        "category": "application_bug"
+      }
+    ],
+    "confidence": 0.95,
+    "root_cause": "The api-service experienced severe CPU saturation during the incident window, with average CPU utilization reaching 84.37% and peaking at 99.4%, which caused significant request latency spikes (p95 duration mean jumping to 944.15ms and duration p95 up to 1351ms) and generated numerous slow request warning logs.",
+    "remediation": [
+      {
+        "risk": "low",
+        "step": "Investigate CPU-intensive background tasks or inefficient database queries executing on the api-service during the incident window."
+      },
+      {
+        "risk": "low",
+        "step": "Scale up or horizontally autoscale the api-service instances to absorb the CPU workload and prevent request queuing."
+      }
+    ],
+    "error": null
+  },
+  {
+    "incident_id": 3,
+    "started_at": "2026-11-24T17:33:00+05:30",
+    "detected_at": "2026-11-24T17:33:20+05:30",
+    "ended_at": "2026-11-24T17:34:10+05:30",
+    "agent_status": "ok",
+    "model_used": "gemini-3.5-flash-lite",
+    "llm_calls": 6,
+    "tools_used": [
+      "get_host_metrics",
+      "get_host_metrics",
+      "get_network_stats",
+      "get_network_stats",
+      "query_logs"
+    ],
+    "category": "network_latency",
+    "alternatives": [
+      {
+        "reason": "Packet drops or application-level simulated packet loss could lead to timeouts, but network latency probes explicitly confirm delayed responses and upstream timeout errors.",
+        "category": "packet_loss"
+      },
+      {
+        "reason": "CPU utilization remained low (mean 2.95%) ruling out CPU saturation as the cause for requests timing out.",
+        "category": "cpu"
+      }
+    ],
+    "confidence": 0.85,
+    "root_cause": "Network latency and communication degradation between services causing upstream request timeouts.",
+    "remediation": [
+      {
+        "risk": "low",
+        "step": "Inspect network routing and service mesh configurations between api-service and its upstream dependencies."
+      },
+      {
+        "risk": "low",
+        "step": "Review upstream service health and scaling limits to mitigate upstream bottlenecks."
+      }
+    ],
+    "error": null
+  },
+  {
+    "incident_id": 4,
+    "started_at": "2026-11-24T17:36:00+05:30",
+    "detected_at": "2026-11-24T17:36:20+05:30",
+    "ended_at": "2026-11-24T17:37:10+05:30",
+    "agent_status": "ok",
+    "model_used": "gemini-3.5-flash-lite",
+    "llm_calls": 6,
+    "tools_used": [
+      "get_host_metrics",
+      "get_network_stats",
+      "recent_changes",
+      "query_logs"
+    ],
+    "category": "unknown",
+    "alternatives": [
+      {
+        "reason": "Request durations increased significantly for specific read/write operations without high CPU, which could indicate downstream database contention or lock waiting, though unobservable in the logs.",
+        "category": "db_lock"
+      },
+      {
+        "reason": "Internal network probe times increased during the incident, but network socket metrics showed zero drops or errors.",
+        "category": "network_latency"
+      }
+    ],
+    "confidence": 0.8,
+    "root_cause": "The incident experienced significant request latency spikes across api-service endpoints (GET /users and POST /orders), but telemetry is insufficient to determine the exact internal or external dependency bottleneck.",
+    "remediation": [
+      {
+        "risk": "low",
+        "step": "Inspect downstream database query performance and connection pool metrics during the incident timeframe."
+      },
+      {
+        "risk": "low",
+        "step": "Review application tracing (e.g., OpenTelemetry/Jaeger) to isolate time spent in external HTTP or database calls."
+      }
+    ],
+    "error": null
+  }
+]
