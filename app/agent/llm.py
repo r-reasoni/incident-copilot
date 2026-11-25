@@ -4,8 +4,9 @@ from __future__ import annotations
 import json
 import logging
 import random
+import re
 import time
-from typing import Any
+from typing import Any, Callable
 
 from app.config import get_settings
 from app.agent.tools import get_host_metrics, get_network_stats
@@ -26,6 +27,7 @@ class GeminiClient:
         self._retries = retries
         self._client: Any | None = None
         self.last_model_used: str = model
+        self.calls_by_model: dict[str, int] = {}
 
     def _get_client(self) -> Any:
         if not self._api_key or self._api_key == "your_key_here":
@@ -43,13 +45,80 @@ class GeminiClient:
             self._client = genai.Client(api_key=self._api_key)
         return self._client
 
+    def _execute_with_retry(self, call_fn: Callable[[Any, str], Any]) -> Any:
+        """Execute a Gemini API call with daily-quota fast-fallback and retry-delay handling."""
+        client = self._get_client()
+        settings = get_settings()
+        fb_raw = getattr(settings, "gemini_fallback_models", "")
+        fallback_candidates = [m.strip() for m in fb_raw.split(",") if m.strip()]
+        models_to_try = [self._model] + [m for m in fallback_candidates if m != self._model]
+
+        for model_idx, model_name in enumerate(models_to_try):
+            for attempt in range(self._retries):
+                self.calls_by_model[model_name] = self.calls_by_model.get(model_name, 0) + 1
+                try:
+                    response = call_fn(client, model_name)
+                    self.last_model_used = model_name
+                    logger.info(
+                        "Gemini response received from %s (calls_by_model=%s)",
+                        model_name,
+                        self.calls_by_model,
+                    )
+                    return response
+                except Exception as exc:
+                    status = self._status_code(exc)
+                    if status == 404:
+                        raise RuntimeError(
+                            f"Model {model_name} is not available for this key. Run "
+                            "python scripts/list_models.py and update GEMINI_MODEL in .env."
+                        ) from exc
+                    if not self._is_retryable(exc):
+                        raise
+                    if self._is_daily_quota_exhausted(exc):
+                        if model_idx + 1 < len(models_to_try):
+                            next_model = models_to_try[model_idx + 1]
+                            logger.warning(
+                                "Model %s hit daily quota (%s); falling back immediately to %s",
+                                model_name,
+                                exc,
+                                next_model,
+                            )
+                            break
+                        raise
+                    if attempt >= self._retries - 1:
+                        if model_idx + 1 < len(models_to_try):
+                            next_model = models_to_try[model_idx + 1]
+                            logger.warning(
+                                "Model %s exhausted %d attempts (%s); falling back to %s",
+                                model_name,
+                                self._retries,
+                                exc,
+                                next_model,
+                            )
+                            break
+                        raise
+                    parsed_delay = self._extract_retry_delay(exc)
+                    if parsed_delay is not None:
+                        delay = parsed_delay
+                    else:
+                        delay = min(60.0, 2.0 * (2 ** attempt)) + random.uniform(0.1, 1.0)
+                    logger.warning(
+                        "Transient error (%s) calling %s (attempt %d/%d). Retrying in %.2fs...",
+                        exc,
+                        model_name,
+                        attempt + 1,
+                        self._retries,
+                        delay,
+                    )
+                    time.sleep(delay)
+        raise RuntimeError("Gemini API call failed without a response")
+
     def generate(
         self,
         system_prompt: str,
         messages: list[dict[str, str]],
         tools: list[Any] | None = None,
     ) -> str:
-        client = self._get_client()
         from google.genai import types
 
         contents = [
@@ -63,46 +132,14 @@ class GeminiClient:
         if tools is not None:
             config["tools"] = tools
 
-        settings = get_settings()
-        fb_raw = getattr(settings, "gemini_fallback_models", "")
-        fallback_candidates = [m.strip() for m in fb_raw.split(",") if m.strip()]
-        models_to_try = [self._model] + [m for m in fallback_candidates if m != self._model]
-
-        for model_idx, model_name in enumerate(models_to_try):
-            for attempt in range(self._retries):
-                try:
-                    response = client.models.generate_content(
-                        model=model_name,
-                        contents=contents,
-                        config=types.GenerateContentConfig(**config),
-                    )
-                    self.last_model_used = model_name
-                    return response.text or ""
-                except Exception as exc:
-                    status = self._status_code(exc)
-                    if status == 404:
-                        raise RuntimeError(
-                            f"Model {model_name} is not available for this key. Run "
-                            "python scripts/list_models.py and update GEMINI_MODEL in .env."
-                        ) from exc
-                    if not self._is_retryable(exc):
-                        raise
-                    if attempt >= self._retries - 1:
-                        if model_idx + 1 < len(models_to_try):
-                            next_model = models_to_try[model_idx + 1]
-                            logger.warning(
-                                "Model %s exhausted %d attempts (%s); falling back to %s",
-                                model_name, self._retries, exc, next_model,
-                            )
-                            break
-                        raise
-                    delay = min(60.0, 2.0 * (2 ** attempt)) + random.uniform(0.1, 1.0)
-                    logger.warning(
-                        "Transient error (%s) calling %s (attempt %d/%d). Retrying in %.2fs...",
-                        exc, model_name, attempt + 1, self._retries, delay,
-                    )
-                    time.sleep(delay)
-        raise RuntimeError("Gemini generation failed without a response")
+        response = self._execute_with_retry(
+            lambda client, model_name: client.models.generate_content(
+                model=model_name,
+                contents=contents,
+                config=types.GenerateContentConfig(**config),
+            )
+        )
+        return response.text or ""
 
     def call_raw(
         self,
@@ -114,7 +151,6 @@ class GeminiClient:
         response_schema: Any | None = None,
     ) -> Any:
         """Call Gemini model with explicit config options and retry logic."""
-        client = self._get_client()
         from google.genai import types
 
         config_dict: dict[str, Any] = {}
@@ -133,46 +169,13 @@ class GeminiClient:
 
         config = types.GenerateContentConfig(**config_dict)
 
-        settings = get_settings()
-        fb_raw = getattr(settings, "gemini_fallback_models", "")
-        fallback_candidates = [m.strip() for m in fb_raw.split(",") if m.strip()]
-        models_to_try = [self._model] + [m for m in fallback_candidates if m != self._model]
-
-        for model_idx, model_name in enumerate(models_to_try):
-            for attempt in range(self._retries):
-                try:
-                    response = client.models.generate_content(
-                        model=model_name,
-                        contents=contents,
-                        config=config,
-                    )
-                    self.last_model_used = model_name
-                    return response
-                except Exception as exc:
-                    status = self._status_code(exc)
-                    if status == 404:
-                        raise RuntimeError(
-                            f"Model {model_name} is not available for this key. Run "
-                            "python scripts/list_models.py and update GEMINI_MODEL in .env."
-                        ) from exc
-                    if not self._is_retryable(exc):
-                        raise
-                    if attempt >= self._retries - 1:
-                        if model_idx + 1 < len(models_to_try):
-                            next_model = models_to_try[model_idx + 1]
-                            logger.warning(
-                                "Model %s exhausted %d attempts (%s); falling back to %s",
-                                model_name, self._retries, exc, next_model,
-                            )
-                            break
-                        raise
-                    delay = min(60.0, 2.0 * (2 ** attempt)) + random.uniform(0.1, 1.0)
-                    logger.warning(
-                        "Transient error (%s) calling %s (attempt %d/%d). Retrying in %.2fs...",
-                        exc, model_name, attempt + 1, self._retries, delay,
-                    )
-                    time.sleep(delay)
-        raise RuntimeError("Gemini API call failed without a response")
+        return self._execute_with_retry(
+            lambda client, model_name: client.models.generate_content(
+                model=model_name,
+                contents=contents,
+                config=config,
+            )
+        )
 
     @staticmethod
     def _status_code(error: Exception) -> int | None:
@@ -192,21 +195,58 @@ class GeminiClient:
         err_msg = str(error).lower()
         return "503" in err_msg or "429" in err_msg or "unavailable" in err_msg or "resource_exhausted" in err_msg
 
+    @staticmethod
+    def _is_daily_quota_exhausted(error: Exception) -> bool:
+        status_code = GeminiClient._status_code(error)
+        err_msg = str(error).lower()
+        is_429 = status_code == 429 or "429" in err_msg or "resource_exhausted" in err_msg
+        if not is_429:
+            return False
+        daily_markers = (
+            "per-day",
+            "per day",
+            "daily limit",
+            "daily_limit",
+            "requestsperday",
+            "perday",
+        )
+        return any(marker in err_msg for marker in daily_markers)
+
+    @staticmethod
+    def _extract_retry_delay(error: Exception) -> float | None:
+        attr_delay = getattr(error, "retry_delay", None)
+        if isinstance(attr_delay, (int, float)) and attr_delay > 0:
+            return min(120.0, max(0.1, float(attr_delay)))
+        msg = str(error)
+        for pattern in (
+            r"retry\s+in\s+(\d+(?:\.\d+)?)\s*s",
+            r"retrydelay[\"']?\s*[:=]\s*[\"']?(\d+(?:\.\d+)?)\s*s",
+        ):
+            match = re.search(pattern, msg, re.IGNORECASE)
+            if match:
+                return min(120.0, max(0.1, float(match.group(1))))
+        return None
+
 
 class MockLLM:
-    """Deterministic rule-based agent used with LLM_PROVIDER=mock.
+    """Metrics-only heuristic baseline used with LLM_PROVIDER=mock.
 
-    Calls get_host_metrics and get_network_stats once each, then decides by rules:
-    - high cpu -> cpu
-    - mem slope rising or high mem -> memory
-    - probe failures with timeouts -> packet_loss
-    - blocked-query/slow-query templates with normal cpu -> db_lock
-    - uniformly high latency with normal cpu and few errors -> network_latency
-    - otherwise -> unknown
+    Calls get_host_metrics and get_network_stats once each (never reads log
+    template text), then classifies using scale-free thresholds relative to the
+    pre-incident baseline window (calibrated on DEV recordings step7 and step7b):
+    - cpu: cpu_mean >= 3.0x baseline (with +25pp delta) or cpu_max >= max(75%, 4x baseline)
+    - memory: mem_max increase over baseline mean >= 25% relative AND mem_slope > 0.02%/min
+      AND mem_mean > baseline mem_mean
+    - packet_loss: probe failure rate delta >= +0.08 (or >0.05 with error_count >= 3x baseline)
+    - db_lock: in_flight_requests peak >= 4.0x baseline mean while CPU stays normal
+    - network_latency: normal CPU, low probe failures, and probe latency >= 3.0x before
+      (or p95_ms >= 3.0x baseline with low error rate)
+    - otherwise: unknown
     """
 
     def __init__(self) -> None:
         self.last_model_used = "mock"
+        self.calls_by_model: dict[str, int] = {"mock": 0}
 
     def generate(
         self,
@@ -215,16 +255,17 @@ class MockLLM:
         tools: list[Any] | None = None,
     ) -> str:
         del system_prompt, tools
+        self.calls_by_model["mock"] = self.calls_by_model.get("mock", 0) + 1
         request = " ".join(message.get("content", "") for message in messages)
         if "single word ok" in request.lower():
             return "OK"
         if "root cause" in request.lower() or "incident" in request.lower():
             return json.dumps(
                 {
-                    "root_cause": "Mock analysis: review the incident evidence and recent changes.",
+                    "root_cause": "Metrics-only heuristic baseline: review the incident evidence and recent changes.",
                     "category": "unknown",
                     "confidence": 0.0,
-                    "evidence": ["Baseline mock test"],
+                    "evidence": ["Metrics-only heuristic baseline test"],
                     "alternatives": [],
                     "remediation": [{"step": "Check service logs", "risk": "low"}],
                 }
@@ -236,7 +277,8 @@ class MockLLM:
         evidence_pack: dict[str, Any],
         session: Any | None = None,
     ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-        """Execute deterministic rule-based investigation for the evidence pack."""
+        """Execute deterministic metrics-only heuristic baseline investigation."""
+        self.calls_by_model["mock"] = self.calls_by_model.get("mock", 0) + 1
         services = evidence_pack.get("affected_services") or ["api-service"]
         service = services[0] if services else "api-service"
         start = evidence_pack.get("started_at") or "2026-01-01T00:00:00+00:00"
@@ -272,60 +314,79 @@ class MockLLM:
         cpu_stats = incident_w.get("cpu_percent", {})
         baseline_cpu = baseline_w.get("cpu_percent", {})
         mem_stats = incident_w.get("mem_percent", {})
+        baseline_mem = baseline_w.get("mem_percent", {})
         p95_stats = incident_w.get("p95_ms", {})
+        baseline_p95 = baseline_w.get("p95_ms", {})
         err_stats = incident_w.get("error_count", {})
+        baseline_err = baseline_w.get("error_count", {})
+        in_flight_stats = incident_w.get("in_flight_requests", {})
+        baseline_in_flight = baseline_w.get("in_flight_requests", {})
+        req_count_stats = incident_w.get("request_count_30s", {})
+        baseline_req = baseline_w.get("request_count_30s", {})
 
         probes = network_stats.get("probes", {})
+        before_probes = probes.get("before", {})
         during_probes = probes.get("during", {})
+        before_probe_fail = float(before_probes.get("failure_rate", 0.0))
         probe_failure_rate = float(during_probes.get("failure_rate", 0.0))
+        before_probe_lat = before_probes.get("mean_probe_ms")
         mean_probe_lat = during_probes.get("mean_probe_ms")
 
         cpu_mean = float(cpu_stats.get("mean", 0.0))
         cpu_max = float(cpu_stats.get("max", 0.0))
+        base_cpu_mean = float(baseline_cpu.get("mean", 0.0))
+
         mem_slope = float(mem_stats.get("slope_per_minute", 0.0))
         mem_mean = float(mem_stats.get("mean", 0.0))
         mem_max = float(mem_stats.get("max", 0.0))
+        base_mem_mean = float(baseline_mem.get("mean", 0.0))
+
         p95_mean = float(p95_stats.get("mean", 0.0))
         p95_max = float(p95_stats.get("max", 0.0))
+        base_p95_mean = float(baseline_p95.get("mean", 0.0))
+
         err_mean = float(err_stats.get("mean", 0.0))
+        base_err_mean = float(baseline_err.get("mean", 0.0))
 
-        in_flight_stats = incident_w.get("in_flight_requests", {})
         in_flight_max = float(in_flight_stats.get("max", 0.0))
-        req_count_stats = incident_w.get("request_count_30s", {})
+        base_in_flight_mean = float(baseline_in_flight.get("mean", 0.0))
         req_count_mean = float(req_count_stats.get("mean", 0.0))
+        base_req_mean = float(baseline_req.get("mean", 0.0))
 
-        # Check template texts for database locks / slow queries
-        template_texts: list[str] = []
-        detail = evidence_pack.get("top_templates_detail") or []
-        for d in detail:
-            if isinstance(d, dict) and "template_text" in d:
-                template_texts.append(str(d["template_text"]).lower())
-        top_tpls = evidence_pack.get("top_templates") or []
-        if isinstance(top_tpls, list):
-            for item in top_tpls:
-                if isinstance(item, dict):
-                    if "text" in item:
-                        template_texts.append(str(item["text"]).lower())
-                    if "template" in item:
-                        template_texts.append(str(item["template"]).lower())
-        elif isinstance(top_tpls, dict):
-            for k in top_tpls.keys():
-                template_texts.append(str(k).lower())
+        # Scale-free relative ratios against baseline_window (DEV-calibrated thresholds)
+        cpu_ratio = cpu_mean / max(base_cpu_mean, 1.0)
+        cpu_delta = cpu_mean - base_cpu_mean
+        cpu_normal = cpu_mean < max(40.0, base_cpu_mean * 3.0)
 
-        has_db_lock_signal = any(
-            any(needle in text for needle in ("lock", "deadlock", "blocked", "slow query", "lock wait", "resumed after database lock wait"))
-            for text in template_texts
-        ) or bool(evidence_pack.get("has_db_lock"))
+        # Memory relative increase over baseline mean
+        mem_rel_inc = (mem_max - base_mem_mean) / max(base_mem_mean, 0.1)
 
-        # Deterministic Rules
-        # Rule 1: High CPU
-        if cpu_mean >= 70.0 or cpu_max >= 80.0 or (cpu_mean >= 50.0 and cpu_mean - float(baseline_cpu.get("mean", 0.0)) >= 30.0):
+        # Probe failure delta and error ratio
+        probe_fail_delta = probe_failure_rate - before_probe_fail
+        err_ratio = err_mean / max(base_err_mean, 0.5)
+
+        # In-flight request peak ratio (DB lock / resource blocking)
+        in_flight_ratio = in_flight_max / max(base_in_flight_mean, 1.0)
+
+        # Probe latency ratio and p95 latency ratio
+        probe_lat_ratio = (
+            float(mean_probe_lat) / max(float(before_probe_lat), 1.0)
+            if mean_probe_lat is not None and before_probe_lat is not None
+            else 0.0
+        )
+        p95_ratio = p95_mean / max(base_p95_mean, 1.0)
+
+        # Rule 1: High CPU relative to baseline
+        if (cpu_ratio >= 3.0 and cpu_delta >= 25.0) or cpu_max >= max(75.0, base_cpu_mean * 4.0):
             return {
                 "category": "cpu",
-                "root_cause": "CPU starvation caused by computation-heavy workload or busy spin loop",
+                "root_cause": (
+                    "Metrics-only heuristic baseline: CPU utilization spiked relative to baseline"
+                ),
                 "confidence": 0.9,
                 "evidence": [
-                    f"CPU elevated to mean {cpu_mean:.1f}% / max {cpu_max:.1f}% during incident (baseline {baseline_cpu.get('mean', 0.0):.1f}%)"
+                    f"CPU elevated to mean {cpu_mean:.1f}% / max {cpu_max:.1f}% "
+                    f"(baseline mean {base_cpu_mean:.1f}%, {cpu_ratio:.1f}x)"
                 ],
                 "alternatives": [
                     {"category": "application_bug", "reason": "Inefficient algorithm or busy-waiting thread loop"}
@@ -336,14 +397,17 @@ class MockLLM:
                 ],
             }, tool_calls_trace
 
-        # Rule 2: Memory slope rising or high memory
-        if mem_slope > 0.05 or mem_mean >= 70.0 or mem_max >= 80.0 or bool(evidence_pack.get("has_memory_leak")):
+        # Rule 2: Sustained memory rise relative to baseline AND positive slope
+        if mem_rel_inc >= 0.25 and mem_slope > 0.02 and mem_mean > base_mem_mean:
             return {
                 "category": "memory",
-                "root_cause": "Memory leak or memory exhaustion due to uncollected object accumulation",
+                "root_cause": (
+                    "Metrics-only heuristic baseline: sustained memory growth relative to baseline"
+                ),
                 "confidence": 0.9,
                 "evidence": [
-                    f"Memory slope increased at {mem_slope:.4f}%/min reaching max {mem_max:.1f}%"
+                    f"Memory rose {mem_rel_inc * 100:.1f}% over baseline mean {base_mem_mean:.2f}% "
+                    f"(max {mem_max:.2f}%, slope {mem_slope:.4f}%/min)"
                 ],
                 "alternatives": [
                     {"category": "application_bug", "reason": "Unbounded cache or object collection retention"}
@@ -354,14 +418,17 @@ class MockLLM:
                 ],
             }, tool_calls_trace
 
-        # Rule 3: Probe failures with timeouts -> packet_loss
-        if probe_failure_rate > 0.10 or bool(evidence_pack.get("has_packet_loss")):
+        # Rule 3: Probe failures / timeouts -> packet_loss
+        if probe_fail_delta >= 0.08 or (probe_failure_rate > 0.05 and err_ratio >= 3.0):
             return {
                 "category": "packet_loss",
-                "root_cause": "Network packet loss causing dropped connections and request timeouts",
+                "root_cause": (
+                    "Metrics-only heuristic baseline: elevated health probe failures and errors"
+                ),
                 "confidence": 0.85,
                 "evidence": [
-                    f"Health check probe failure rate of {probe_failure_rate*100:.1f}% with connection timeouts"
+                    f"Probe failure rate {probe_failure_rate * 100:.1f}% "
+                    f"(before {before_probe_fail * 100:.1f}%, error_count {err_mean:.1f})"
                 ],
                 "alternatives": [
                     {"category": "network_latency", "reason": "Severe network latency causing client timeouts"}
@@ -372,18 +439,17 @@ class MockLLM:
                 ],
             }, tool_calls_trace
 
-        # Rule 4: in_flight high with low CPU and few completed requests, or lock templates -> db_lock
-        if (
-            (in_flight_max >= 5 and cpu_mean < 50.0 and req_count_mean < 25)
-            or (has_db_lock_signal and cpu_mean < 70.0)
-            or bool(evidence_pack.get("has_db_lock"))
-        ):
+        # Rule 4: In-flight requests peak several times baseline mean while CPU is normal -> db_lock
+        if in_flight_ratio >= 4.0 and cpu_normal:
             return {
                 "category": "db_lock",
-                "root_cause": "Database lock contention blocking transaction execution and request completion",
+                "root_cause": (
+                    "Metrics-only heuristic baseline: in-flight requests surged relative to baseline with normal CPU"
+                ),
                 "confidence": 0.9,
                 "evidence": [
-                    f"In-flight requests reached {in_flight_max:.0f} with low CPU ({cpu_mean:.1f}%) and low request completion ({req_count_mean:.1f}/30s)"
+                    f"In-flight peak {in_flight_max:.0f} ({in_flight_ratio:.1f}x baseline mean {base_in_flight_mean:.2f}), "
+                    f"CPU {cpu_mean:.1f}%, requests/30s {req_count_mean:.1f} (baseline {base_req_mean:.1f})"
                 ],
                 "alternatives": [
                     {"category": "application_bug", "reason": "Long-running uncommitted transactions holding locks"}
@@ -394,19 +460,24 @@ class MockLLM:
                 ],
             }, tool_calls_trace
 
-        # Rule 5: Uniformly high latency with normal CPU and few errors -> network_latency
+        # Rule 5: Uniformly elevated latency with normal CPU and low probe failures -> network_latency
         if (
-            cpu_mean < 70.0
-            and probe_failure_rate <= 0.10
-            and err_mean < 5.0
-            and (p95_max >= 300.0 or (mean_probe_lat is not None and mean_probe_lat >= 300.0) or bool(evidence_pack.get("has_latency")))
+            cpu_normal
+            and probe_fail_delta < 0.08
+            and (
+                probe_lat_ratio >= 3.0
+                or (p95_ratio >= 3.0 and err_mean <= max(2.0, base_err_mean * 2.0))
+            )
         ):
             return {
                 "category": "network_latency",
-                "root_cause": "Elevated network latency causing high end-to-end request duration",
+                "root_cause": (
+                    "Metrics-only heuristic baseline: request and probe latency elevated with normal CPU"
+                ),
                 "confidence": 0.85,
                 "evidence": [
-                    f"P95 latency elevated to {p95_max:.1f}ms while CPU and error rates remained normal"
+                    f"P95 latency mean {p95_mean:.1f}ms (max {p95_max:.1f}ms), "
+                    f"probe latency {mean_probe_lat}ms vs {before_probe_lat}ms before"
                 ],
                 "alternatives": [
                     {"category": "application_bug", "reason": "Downstream dependency latency degradation"}
@@ -420,9 +491,11 @@ class MockLLM:
         # Fallback: unknown
         return {
             "category": "unknown",
-            "root_cause": "Insufficient evidence to distinguish between fault categories",
+            "root_cause": (
+                "Metrics-only heuristic baseline: insufficient metric separation between categories"
+            ),
             "confidence": 0.0,
-            "evidence": ["Metrics and logs did not exhibit distinctive anomalous patterns"],
+            "evidence": ["Metrics did not cross relative baseline thresholds"],
             "alternatives": [],
             "remediation": [{"step": "Perform manual log inspection and service health audit", "risk": "low"}],
         }, tool_calls_trace

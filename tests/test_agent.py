@@ -139,8 +139,14 @@ def test_mock_llm_categories_on_hand_built_evidence():
     ev_mem = {
         "affected_services": ["api-service"],
         "host_metrics": {
-            "incident_window": {"cpu_percent": {"mean": 20.0, "max": 25.0}, "mem_percent": {"slope_per_minute": 0.15, "max": 88.0}},
-            "baseline_window": {"cpu_percent": {"mean": 15.0}},
+            "incident_window": {
+                "cpu_percent": {"mean": 20.0, "max": 25.0},
+                "mem_percent": {"slope_per_minute": 0.15, "mean": 75.0, "max": 88.0},
+            },
+            "baseline_window": {
+                "cpu_percent": {"mean": 15.0},
+                "mem_percent": {"mean": 45.0},
+            },
         },
         "network_stats": {"probes": {"during": {"failure_rate": 0.0}}},
     }
@@ -161,18 +167,24 @@ def test_mock_llm_categories_on_hand_built_evidence():
     assert res_pkt["category"] == "packet_loss"
     assert res_pkt["confidence"] >= 0.85
 
-    # 4. DB lock
+    # 4. DB lock (metrics-only: in_flight_requests peak several times baseline while CPU is normal)
     ev_db = {
         "affected_services": ["api-service"],
         "host_metrics": {
-            "incident_window": {"cpu_percent": {"mean": 15.0, "max": 20.0}, "mem_percent": {"slope_per_minute": 0.0, "max": 40.0}},
-            "baseline_window": {"cpu_percent": {"mean": 15.0}},
+            "incident_window": {
+                "cpu_percent": {"mean": 15.0, "max": 20.0},
+                "mem_percent": {"slope_per_minute": 0.0, "mean": 40.0, "max": 40.0},
+                "in_flight_requests": {"max": 25},
+                "request_count_30s": {"mean": 80.0},
+            },
+            "baseline_window": {
+                "cpu_percent": {"mean": 15.0},
+                "mem_percent": {"mean": 40.0},
+                "in_flight_requests": {"mean": 1.5},
+                "request_count_30s": {"mean": 250.0},
+            },
         },
         "network_stats": {"probes": {"during": {"failure_rate": 0.0}}},
-        "top_templates_detail": [
-            {"template_text": "Database query lock acquisition timeout on table accounts"},
-            {"template_text": "Slow query detected: waited 15000ms for lock"},
-        ],
     }
     res_db, _ = mock_llm.investigate(ev_db)
     assert res_db["category"] == "db_lock"
@@ -630,3 +642,90 @@ def test_agent_out_schema(tmp_path):
     forbidden_keys = {"fault_type", "target_service", "faults", "fault_events", "ground_truth"}
     for k in forbidden_keys:
         assert k not in rec
+
+
+def test_no_tool_reads_fault_events():
+    """Confirm every registered tool in TOOL_FUNCTIONS has zero references to fault_events."""
+    import inspect
+    from app.agent.tools import TOOL_FUNCTIONS
+
+    assert set(TOOL_FUNCTIONS.keys()) == {
+        "query_logs",
+        "get_host_metrics",
+        "get_network_stats",
+        "recent_changes",
+    }
+    for name, fn in TOOL_FUNCTIONS.items():
+        src = inspect.getsource(fn)
+        assert "fault_events" not in src, f"Tool {name} references fault_events"
+        assert "FaultEvent" not in src, f"Tool {name} references FaultEvent"
+
+
+def test_system_prompt_is_generic():
+    """Ensure SYSTEM_PROMPT contains category signatures without testbed-specific strings."""
+    from app.agent.agent import SYSTEM_PROMPT
+
+    for forbidden in ("api-service", "worker-service", "cpu_hog", "memory_leak", "/orders", "/users", "Order persistence"):
+        assert forbidden not in SYSTEM_PROMPT
+    for cat in ("cpu", "memory", "network_latency", "packet_loss", "db_lock", "application_bug", "unknown"):
+        assert cat in SYSTEM_PROMPT
+
+
+def test_gemini_daily_quota_fast_fallback_and_retry_delay(monkeypatch, caplog):
+    """Scripted fake client: daily 429 skips retries; per-minute 429 honours retry delay; logs calls."""
+    import logging
+    from types import SimpleNamespace
+    from app.agent.llm import GeminiClient
+
+    sleeps: list[float] = []
+    monkeypatch.setattr("app.agent.llm.time.sleep", lambda s: sleeps.append(s))
+
+    fake_settings = SimpleNamespace(gemini_fallback_models="fallback-model-b")
+    monkeypatch.setattr("app.agent.llm.get_settings", lambda: fake_settings)
+
+    class _QuotaError(Exception):
+        def __init__(self, msg: str, status_code: int = 429) -> None:
+            super().__init__(msg)
+            self.status_code = status_code
+
+    # 1. Daily quota 429 on primary -> immediate fallback, zero sleeps
+    call_log: list[str] = []
+
+    class _FakeModelsDaily:
+        def generate_content(self, model: str, contents, config):
+            call_log.append(model)
+            if model == "primary-model-a":
+                raise _QuotaError("429 RESOURCE_EXHAUSTED: exceeded per-day limit")
+            return SimpleNamespace(text="OK from fallback")
+
+    client = GeminiClient(api_key="fake-key", model="primary-model-a", retries=4)
+    client._client = SimpleNamespace(models=_FakeModelsDaily())
+
+    with caplog.at_level(logging.INFO):
+        out = client.generate("sys", [{"role": "user", "content": "hi"}])
+
+    assert out == "OK from fallback"
+    assert call_log == ["primary-model-a", "fallback-model-b"]
+    assert sleeps == []
+    assert client.last_model_used == "fallback-model-b"
+    assert client.calls_by_model == {"primary-model-a": 1, "fallback-model-b": 1}
+    assert "fallback-model-b" in caplog.text
+
+    # 2. Per-minute 429 with explicit retry delay -> honours exact delay and retries same model
+    sleeps.clear()
+    attempts = {"n": 0}
+
+    class _FakeModelsPerMin:
+        def generate_content(self, model: str, contents, config):
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                raise _QuotaError("429 RESOURCE_EXHAUSTED: Rate limit exceeded. Please retry in 3.5s.")
+            return SimpleNamespace(text="OK after retry")
+
+    client2 = GeminiClient(api_key="fake-key", model="primary-model-a", retries=3)
+    client2._client = SimpleNamespace(models=_FakeModelsPerMin())
+    out2 = client2.generate("sys", [{"role": "user", "content": "hi"}])
+
+    assert out2 == "OK after retry"
+    assert sleeps == [3.5]
+    assert client2.calls_by_model == {"primary-model-a": 2}

@@ -221,15 +221,22 @@ so the schema never needs migration for new features.
 
 ## 5. LLM Agent Tools
 
-The agent is given these tools to investigate an incident:
+The agent is given these registered tools (`app/agent/tools.py`) to investigate an incident:
 
-| Tool | Input | Output |
+| Tool | Arguments | Output |
 |---|---|---|
-| `get_incident_windows` | `incident_id` | List of scored windows (feature vectors + scores) |
-| `search_logs` | `incident_id, regex, limit` | Matching raw log lines from the incident's time range |
-| `get_template_counts` | `incident_id` | Template ID → count histogram for the incident |
-| `get_host_metrics` | `incident_id` | CPU / memory time series from stored windows |
-| `get_recent_deploys` | `since, until` | Placeholder – returns empty list until wired to a CI system |
+| `query_logs` | `service, start, end, level?, template_id?, limit=50` | Matching log rows (`ts`, `level`, `template_id`, `message` truncated to 200 chars, max 100 rows) |
+| `get_host_metrics` | `service, start, end` | Summary of `cpu_percent`, `mem_percent` (with `slope_per_minute`), `p95_ms`, `error_count`, `in_flight_requests`, `request_count_30s` for `incident_window` vs. 5-minute `baseline_window` |
+| `get_network_stats` | `service, start, end` | Health probe `failure_rate`, `mean_probe_ms`, `p95_probe_ms` (`before` vs. `during`) plus live `psutil` network snapshot |
+| `recent_changes` | `start, end` | Entries from `changes.json` within `[start, end]` |
+
+Documented (unregistered / evidence-pack-supplied) template tool:
+
+| Tool | Arguments | Notes |
+|---|---|---|
+| `query_log_templates` | `service, start, end, limit=20` | Template frequency summary for a time range. Not registered as a separate callable tool because `top_templates` and `top_templates_detail` are already embedded in the incident evidence pack. |
+
+When `LLM_PROVIDER=mock`, `MockLLM` acts as a **metrics-only heuristic baseline**: it calls `get_host_metrics` and `get_network_stats`, never reads log template text, and classifies incidents using scale-free thresholds relative to `baseline_window`.
 
 The agent runs in a **tool-loop** until it has enough information to produce
 a final answer structured as:
@@ -299,6 +306,14 @@ The harness measures:
 - **Loadgen Synchronization**: In `eval/run_step7.py`, traffic generation (`loadgen`) runs continuously until the post-fault observation window finishes (last fault end + 150 seconds). Both load generation and log recording terminate concurrently so that abrupt traffic drops do not generate false positive incidents.
 - **Replay Truncation Default**: In `eval/replay.py`, `--truncate-after-faults` defaults to 120 seconds after the final fault ends. Events logged beyond this 120-second recovery boundary represent testbed teardown and process exit artifacts, which are excluded from offline benchmark evaluations.
 - **Per-Provider Agent Output**: In `eval/replay.py`, `--agent-out <path>` writes structured per-incident agent diagnostics (incident metadata, status, model used, tool calls, category, confidence, root cause, remediation, and errors) without ground-truth fault labels to decouple analysis recording from evaluation scoring.
+
+### 8.3 Evaluation Protocol
+
+- **DEV recordings**: The development recordings are `eval/runs/step7` and `eval/runs/step7b` ONLY. Prompt tuning, `MockLLM` calibration, and budget selection are performed exclusively on these two recordings.
+- **Code freeze**: All detection, tooling, agent, prompt, `MockLLM`, and testbed code is frozen at git tag `eval-freeze-v1`.
+- **Test recording**: The held-out test recording is generated *after* tagging `eval-freeze-v1`.
+- **Post-tag changes**: Any code change after `eval-freeze-v1` invalidates the held-out test and requires generating a new test recording.
+- **Deterministic reporting**: All reported evaluation results come strictly from deterministic event-time replay (`eval.replay`), never from live-run numbers or DEV numbers presented as final results.
 
 ---
 

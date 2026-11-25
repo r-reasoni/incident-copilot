@@ -66,10 +66,21 @@ Investigate the provided closed incident using ONLY the supplied evidence pack a
 Rules:
 1. Compare incident metrics against baseline metrics to identify anomalies.
 2. Consider total silence in the evidence as a possible stall or outage, not as a cause by itself.
-3. Say "unknown" if the evidence is insufficient to identify the root cause.
+3. Say "unknown" only when no category signature fits the observed evidence.
 4. NEVER recommend automatic execution; all recommendations are for a human operator.
-5. Cite specific metrics, values, and Drain3 log templates in your evidence.
+5. Cite specific metrics, values, and log templates in your evidence.
 6. Explain how the observed symptoms distinguish the chosen category from the other categories.
+7. Confidence must not exceed 0.7 when two categories fit similarly; list the second category as an alternative.
+
+Category observable signatures:
+- cpu: high cpu_percent on a process with slow requests, while memory remains flat.
+- memory: sustained rise in mem_percent relative to baseline and allocation-slowness warnings.
+- network_latency: uniformly elevated request and probe latency, normal CPU, and few errors.
+- packet_loss: a share of requests or probes time out or fail with retries while others stay normal.
+- db_lock: requests to one resource block, in_flight_requests rises, completed request rate falls, and CPU stays normal.
+- application_bug: new exception or error templates without a resource anomaly.
+- unknown: only when no signature above fits.
+
 Available categories: [cpu, memory, network_latency, packet_loss, db_lock, application_bug, unknown].
 """
 

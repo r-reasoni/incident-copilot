@@ -70,10 +70,31 @@ python -m app.db.init
 pytest
 
 # 8. Start the API server
-uvicorn app.api.main:app --reload
+copilot serve --port 8000
 
 # Stop PostgreSQL when finished
 docker compose down
+```
+
+---
+
+## CLI Usage (`copilot`)
+
+After `pip install -e ".[dev]"`, the `copilot` command is available:
+
+```bash
+copilot --help                              # Show all commands
+copilot init-db                             # Initialize PostgreSQL schema
+copilot serve --port 8000                   # Start FastAPI + uvicorn server
+copilot replay testbed/logs/api-service.log --mock --speed 0
+                                            # Replay a plain log file in-process (event time)
+copilot incidents [--status analyzed]       # Rich table of incidents
+copilot show <id>                           # Rich panel with root cause, evidence, alternatives & remediation
+copilot stats                               # Counts + % LLM calls saved vs per-log and per-window
+copilot watch [--url ws://localhost:8000/ws/alerts]
+                                            # Live alert stream (auto-reconnects)
+copilot demo --fault cpu_hog --fast         # End-to-end live demo (~5 min with --fast)
+copilot eval --runs 3 --mock                # Evaluation harness (Step 9)
 ```
 
 The commands above are the direct commands for Windows PowerShell. The equivalent
